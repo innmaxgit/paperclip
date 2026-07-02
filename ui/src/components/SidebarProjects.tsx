@@ -21,6 +21,7 @@ import { SIDEBAR_SCROLL_RESET_STATE } from "../lib/navigation-scroll";
 import { queryKeys } from "../lib/queryKeys";
 import { cn, projectRouteRef, SIDEBAR_RAIL_HIDDEN_LABEL } from "../lib/utils";
 import { useProjectOrder } from "../hooks/useProjectOrder";
+import { usePinnedProjects } from "../hooks/usePinnedProjects";
 import { resourceMembershipState, useResourceMembershipMutation, useResourceMemberships } from "../hooks/useResourceMemberships";
 import { useProjectExternalObjectSummary } from "../hooks/useIssueExternalObjects";
 import { BudgetSidebarMarker } from "./BudgetSidebarMarker";
@@ -280,6 +281,7 @@ export function SidebarProjects() {
   });
 
   const currentUserId = session?.user?.id ?? session?.session?.userId ?? null;
+  const { pinnedIds } = usePinnedProjects(selectedCompanyId);
   const sortModeStorageKey = useMemo(() => {
     if (!selectedCompanyId) return null;
     return getProjectSortModeStorageKey(selectedCompanyId, currentUserId);
@@ -308,6 +310,13 @@ export function SidebarProjects() {
   );
   const isTopMode = sortMode === "top";
   const canReorderProjects = isTopMode && !isMobile && fineReorderPointer;
+  const pinnedProjects = useMemo(
+    () => pinnedIds.flatMap((id) => {
+      const project = visibleProjects.find((p) => p.id === id);
+      return project ? [project] : [];
+    }),
+    [pinnedIds, visibleProjects],
+  );
 
   const projectMatch = location.pathname.match(/^\/(?:[^/]+\/)?projects\/([^/]+)/);
   const activeProjectRef = projectMatch?.[1] ?? null;
@@ -409,6 +418,14 @@ export function SidebarProjects() {
   );
 
   return (
+    <>
+      {pinnedProjects.length > 0 && (
+        <SidebarSection label="Pinned">
+          <div className="flex flex-col gap-0.5">
+            {pinnedProjects.map((project) => renderProject(project))}
+          </div>
+        </SidebarSection>
+      )}
     <SidebarSection
       label="Projects"
       collapsible={{ open, onOpenChange: setOpen }}
@@ -464,5 +481,6 @@ export function SidebarProjects() {
         </div>
       )}
     </SidebarSection>
+    </>
   );
 }

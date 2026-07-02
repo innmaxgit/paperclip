@@ -18,9 +18,11 @@ import {
   useResourceMembershipMutation,
   useResourceMemberships,
 } from "../hooks/useResourceMemberships";
+import { usePinnedProjects } from "../hooks/usePinnedProjects";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { ArrowUpDown, Check, Hexagon, Plus } from "lucide-react";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { ArrowUpDown, Check, Hexagon, Pin, PinOff, Plus } from "lucide-react";
 
 type ProjectSortField = "name" | "updated" | "created" | "targetDate";
 type ProjectSortDir = "asc" | "desc";
@@ -79,6 +81,7 @@ export function Projects() {
   const { setBreadcrumbs } = useBreadcrumbs();
   const [sortField, setSortField] = useState<ProjectSortField>("name");
   const [sortDir, setSortDir] = useState<ProjectSortDir>("asc");
+  const { togglePin, isPinned } = usePinnedProjects(selectedCompanyId);
 
   useEffect(() => {
     setBreadcrumbs([{ label: "Projects" }]);
@@ -232,6 +235,28 @@ export function Projects() {
                               </span>
                             )}
                             <StatusBadge status={project.status} />
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  className="h-7 w-7"
+                                  onClick={(e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    togglePin(project.id);
+                                  }}
+                                  aria-label={isPinned(project.id) ? `Unpin ${project.name}` : `Pin ${project.name}`}
+                                >
+                                  {isPinned(project.id)
+                                    ? <PinOff className="h-3.5 w-3.5 text-foreground" />
+                                    : <Pin className="h-3.5 w-3.5 text-muted-foreground" />}
+                                </Button>
+                              </TooltipTrigger>
+                              <TooltipContent>
+                                {isPinned(project.id) ? "Unpin from sidebar" : "Pin to sidebar"}
+                              </TooltipContent>
+                            </Tooltip>
                             <MembershipAction
                               state={state}
                               pending={pending}

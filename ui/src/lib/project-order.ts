@@ -2,8 +2,10 @@ import type { Project } from "@paperclipai/shared";
 
 export const PROJECT_ORDER_UPDATED_EVENT = "paperclip:project-order-updated";
 export const PROJECT_SORT_MODE_UPDATED_EVENT = "paperclip:project-sort-mode-updated";
+export const PROJECT_PINNED_UPDATED_EVENT = "paperclip:project-pinned-updated";
 const PROJECT_ORDER_STORAGE_PREFIX = "paperclip.projectOrder";
 const PROJECT_SORT_MODE_STORAGE_PREFIX = "paperclip.projectSortMode";
+const PROJECT_PINNED_STORAGE_PREFIX = "paperclip.projectPinned";
 const ANONYMOUS_USER_ID = "anonymous";
 
 export type ProjectSidebarSortMode = "top" | "alphabetical" | "recent";
@@ -16,6 +18,11 @@ type ProjectOrderUpdatedDetail = {
 export type ProjectSortModeUpdatedDetail = {
   storageKey: string;
   sortMode: ProjectSidebarSortMode;
+};
+
+export type ProjectPinnedUpdatedDetail = {
+  storageKey: string;
+  pinnedIds: string[];
 };
 
 function normalizeIdList(value: unknown): string[] {
@@ -39,6 +46,10 @@ export function getProjectOrderStorageKey(companyId: string, userId: string | nu
 
 export function getProjectSortModeStorageKey(companyId: string, userId: string | null | undefined): string {
   return `${PROJECT_SORT_MODE_STORAGE_PREFIX}:${companyId}:${resolveUserId(userId)}`;
+}
+
+export function getPinnedProjectsStorageKey(companyId: string, userId: string | null | undefined): string {
+  return `${PROJECT_PINNED_STORAGE_PREFIX}:${companyId}:${resolveUserId(userId)}`;
 }
 
 export function readProjectOrder(storageKey: string): string[] {
@@ -70,6 +81,32 @@ export function writeProjectOrder(storageKey: string, orderedIds: string[]) {
     window.dispatchEvent(
       new CustomEvent<ProjectOrderUpdatedDetail>(PROJECT_ORDER_UPDATED_EVENT, {
         detail: { storageKey, orderedIds: normalized },
+      }),
+    );
+  }
+}
+
+export function readPinnedProjects(storageKey: string): string[] {
+  try {
+    const raw = localStorage.getItem(storageKey);
+    if (!raw) return [];
+    return normalizeIdList(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+}
+
+export function writePinnedProjects(storageKey: string, pinnedIds: string[]) {
+  const normalized = normalizeIdList(pinnedIds);
+  try {
+    localStorage.setItem(storageKey, JSON.stringify(normalized));
+  } catch {
+    // Ignore storage write failures in restricted browser contexts.
+  }
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(
+      new CustomEvent<ProjectPinnedUpdatedDetail>(PROJECT_PINNED_UPDATED_EVENT, {
+        detail: { storageKey, pinnedIds: normalized },
       }),
     );
   }
