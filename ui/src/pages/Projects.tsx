@@ -243,10 +243,10 @@ export function Projects() {
                                   className="h-7 w-7"
                                   onPointerDown={(e) => {
                                     if (e.button !== 0) return;
-                                    e.preventDefault();
                                     e.stopPropagation();
                                     togglePin(project.id);
                                   }}
+                                  onClick={(e) => e.stopPropagation()}
                                   aria-label={isPinned(project.id) ? `Unpin ${project.name}` : `Pin ${project.name}`}
                                 >
                                   {isPinned(project.id)
