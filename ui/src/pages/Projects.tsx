@@ -241,7 +241,8 @@ export function Projects() {
                                   variant="ghost"
                                   size="icon-xs"
                                   className="h-7 w-7"
-                                  onClick={(e) => {
+                                  onPointerDown={(e) => {
+                                    if (e.button !== 0) return;
                                     e.preventDefault();
                                     e.stopPropagation();
                                     togglePin(project.id);
