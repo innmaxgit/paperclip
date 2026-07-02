@@ -253,6 +253,88 @@ function SortableProjectItem(props: ProjectItemProps) {
   );
 }
 
+export function SidebarPinnedProjects() {
+  const { selectedCompany, selectedCompanyId } = useCompany();
+  const { isMobile, setSidebarOpen, collapsed, peeking } = useSidebar();
+  const rail = collapsed && !peeking;
+  const location = useLocation();
+
+  const { data: projects } = useQuery({
+    queryKey: queryKeys.projects.list(selectedCompanyId!),
+    queryFn: () => projectsApi.list(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+  });
+  const membershipsQuery = useResourceMemberships(selectedCompanyId);
+  const membershipMutation = useResourceMembershipMutation(selectedCompanyId);
+  const { slots: projectSidebarSlots } = usePluginSlots({
+    slotTypes: ["projectSidebarItem"],
+    entityType: "project",
+    companyId: selectedCompanyId,
+    enabled: !!selectedCompanyId,
+  });
+  const { pinnedIds } = usePinnedProjects(selectedCompanyId);
+
+  const visibleProjects = useMemo(
+    () => (projects ?? []).filter((project: Project) => {
+      if (project.archivedAt) return false;
+      if (!membershipsQuery.isSuccess) return true;
+      return resourceMembershipState(membershipsQuery.data, "project", project.id) !== "left";
+    }),
+    [membershipsQuery.data, membershipsQuery.isSuccess, projects],
+  );
+  const pinnedProjects = useMemo(
+    () => pinnedIds.flatMap((id) => {
+      const project = visibleProjects.find((p) => p.id === id);
+      return project ? [project] : [];
+    }),
+    [pinnedIds, visibleProjects],
+  );
+
+  const projectMatch = location.pathname.match(/^\/(?:[^/]+\/)?projects\/([^/]+)/);
+  const activeProjectRef = projectMatch?.[1] ?? null;
+
+  const leaveProject = useCallback(
+    (project: Project) => membershipMutation.mutate({
+      resourceType: "project",
+      resourceId: project.id,
+      resourceName: project.name,
+      state: "left",
+    }),
+    [membershipMutation],
+  );
+  const projectLeaving = useCallback(
+    (project: Project) =>
+      membershipMutation.isPending &&
+      membershipMutation.variables?.resourceType === "project" &&
+      membershipMutation.variables.resourceId === project.id,
+    [membershipMutation.isPending, membershipMutation.variables],
+  );
+
+  if (pinnedProjects.length === 0) return null;
+
+  return (
+    <SidebarSection label="Pinned">
+      <div className="flex flex-col gap-0.5">
+        {pinnedProjects.map((project) => (
+          <ProjectItem
+            key={project.id}
+            activeProjectRef={activeProjectRef}
+            companyId={selectedCompanyId}
+            companyPrefix={selectedCompany?.issuePrefix ?? null}
+            isMobile={isMobile}
+            project={project}
+            projectSidebarSlots={projectSidebarSlots}
+            rail={rail}
+            setSidebarOpen={setSidebarOpen}
+            onLeaveProject={leaveProject}
+            leaving={projectLeaving(project)}
+          />
+        ))}
+      </div>
+    </SidebarSection>
+  );
+}
+
 export function SidebarProjects() {
   const [open, setOpen] = useState(true);
   const { selectedCompany, selectedCompanyId } = useCompany();
