@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "@/lib/router";
 import { useQuery } from "@tanstack/react-query";
 import type { Project } from "@paperclipai/shared";
 import { projectsApi } from "../api/projects";
@@ -79,6 +80,7 @@ export function Projects() {
   const { selectedCompanyId } = useCompany();
   const { openNewProject } = useDialogActions();
   const { setBreadcrumbs } = useBreadcrumbs();
+  const navigate = useNavigate();
   const [sortField, setSortField] = useState<ProjectSortField>("name");
   const [sortDir, setSortDir] = useState<ProjectSortDir>("asc");
   const { togglePin, isPinned } = usePinnedProjects(selectedCompanyId);
@@ -214,7 +216,7 @@ export function Projects() {
                         title={project.name}
                         subtitle={project.description ?? undefined}
                         reserveSubtitleSpace
-                        to={projectUrl(project)}
+                        onClick={() => navigate(projectUrl(project))}
                         className={state === "left" ? "group text-foreground/55" : "group"}
                         trailing={
                           <div className="flex items-center gap-3">
