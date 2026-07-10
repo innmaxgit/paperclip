@@ -972,6 +972,10 @@ export async function startServer(): Promise<StartedServer> {
         .then((result) => {
           if (result.timedOut > 0 || result.failed > 0) {
             logger.warn({ ...result }, "environment customImage setup cleanup changed sessions");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "environment customImage setup cleanup failed");
         }));
   
       // Periodically reap orphaned runs (5-min staleness threshold) and make sure
