@@ -27,8 +27,8 @@ import { NavLink } from "@/lib/router";
 import { SidebarSection } from "./SidebarSection";
 import { SidebarNavItem } from "./SidebarNavItem";
 import { SidebarAgents } from "./SidebarAgents";
-import { SidebarProjects } from "./SidebarProjects";
 import { SidebarStarredProjects } from "./SidebarStarredProjects";
+import { SidebarProjects, SidebarPinnedProjects } from "./SidebarProjects";
 import { useDialogActions } from "../context/DialogContext";
 import { useCompany } from "../context/CompanyContext";
 import { useSidebar } from "../context/SidebarContext";
@@ -239,8 +239,8 @@ export function Sidebar() {
           />
         </SidebarSection>
 
-        {/* Classic mode restores the per-project collapsible below Work. */}
-        {streamlined ? null : <SidebarProjects />}
+        {/* Streamlined mode: only show pinned projects; classic mode: full project collapsible (includes pinned). */}
+        {streamlined ? <SidebarPinnedProjects /> : <SidebarProjects />}
 
         <SidebarAgents streamlined={streamlined} />
 
