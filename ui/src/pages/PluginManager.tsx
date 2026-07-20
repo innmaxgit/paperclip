@@ -27,6 +27,7 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToastActions } from "@/context/ToastContext";
 import { cn } from "@/lib/utils";
 
@@ -92,6 +93,7 @@ export function PluginManager() {
   const { pushToast } = useToastActions();
 
   const [installPackage, setInstallPackage] = useState("");
+  const [installSource, setInstallSource] = useState<"npm" | "local">("npm");
   const [installDialogOpen, setInstallDialogOpen] = useState(false);
   const [uninstallPluginId, setUninstallPluginId] = useState<string | null>(null);
   const [uninstallPluginName, setUninstallPluginName] = useState<string>("");
@@ -129,6 +131,7 @@ export function PluginManager() {
       invalidatePluginQueries();
       setInstallDialogOpen(false);
       setInstallPackage("");
+      setInstallSource("npm");
       pushToast({ title: "Plugin installed successfully", tone: "success" });
     },
     onError: (err: Error) => {
@@ -173,11 +176,13 @@ export function PluginManager() {
   const bundledPlugins = bundledQuery.data ?? [];
   const installedByPackageName = new Map(installedPlugins.map((plugin) => [plugin.packageName, plugin]));
   const bundledByPackageName = new Map(bundledPlugins.map((plugin) => [plugin.packageName, plugin]));
-  // Scope the in-section banner to bundled (local-path) installs so an npm-dialog
-  // install failure does not surface its error in the bundled-plugins section.
-  const installErrorMessage = installMutation.variables?.isLocalPath
-    ? installMutation.error?.message ?? null
-    : null;
+  // Scope the in-section banner to bundled installs (dialog-initiated failures
+  // stay in the still-open dialog + toast). The dialog only closes onSuccess,
+  // so an errored mutation with the dialog open must be a dialog install.
+  const installErrorMessage =
+    installMutation.variables?.isLocalPath && !installDialogOpen
+      ? installMutation.error?.message ?? null
+      : null;
   const errorSummaryByPluginId = useMemo(
     () =>
       new Map(
@@ -208,15 +213,35 @@ export function PluginManager() {
             <DialogHeader>
               <DialogTitle>Install Plugin</DialogTitle>
               <DialogDescription>
-                Enter the npm package name of the plugin you wish to install.
+                {installSource === "local"
+                  ? "Enter an absolute filesystem path to a local plugin package."
+                  : "Enter the npm package name of the plugin you wish to install."}
               </DialogDescription>
             </DialogHeader>
             <div className="grid gap-4 py-4">
+              <Tabs
+                value={installSource}
+                onValueChange={(value) => {
+                  setInstallSource(value as "npm" | "local");
+                  setInstallPackage("");
+                }}
+              >
+                <TabsList className="w-full">
+                  <TabsTrigger value="npm" className="flex-1">npm</TabsTrigger>
+                  <TabsTrigger value="local" className="flex-1">Local path</TabsTrigger>
+                </TabsList>
+              </Tabs>
               <div className="grid gap-2">
-                <Label htmlFor="packageName">npm Package Name</Label>
+                <Label htmlFor="packageName">
+                  {installSource === "local" ? "Local path" : "npm Package Name"}
+                </Label>
                 <Input
                   id="packageName"
-                  placeholder="@paperclipai/plugin-example"
+                  placeholder={
+                    installSource === "local"
+                      ? "/absolute/path/to/plugin"
+                      : "@paperclipai/plugin-example"
+                  }
                   value={installPackage}
                   onChange={(e) => setInstallPackage(e.target.value)}
                 />
@@ -225,8 +250,13 @@ export function PluginManager() {
             <DialogFooter>
               <Button variant="outline" onClick={() => setInstallDialogOpen(false)}>Cancel</Button>
               <Button
-                onClick={() => installMutation.mutate({ packageName: installPackage })}
-                disabled={!installPackage || installMutation.isPending}
+                onClick={() =>
+                  installMutation.mutate({
+                    packageName: installPackage.trim(),
+                    isLocalPath: installSource === "local",
+                  })
+                }
+                disabled={!installPackage.trim() || installMutation.isPending}
               >
                 {installMutation.isPending ? "Installing..." : "Install"}
               </Button>
