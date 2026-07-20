@@ -920,7 +920,7 @@ const ArrayField = React.memo(({
           >
             <div className="flex-1">
               <div className="mb-2 text-xs font-medium text-muted-foreground">
-                Item {index + 1}
+                {`${itemSchema?.title || label || "Item"}-${index + 1}`}
               </div>
               <FormField
                 propSchema={itemSchema}
