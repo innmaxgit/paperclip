@@ -181,6 +181,11 @@ export type {
   PluginEnvironmentRealizeWorkspaceResult,
   PluginEnvironmentExecuteParams,
   PluginEnvironmentExecuteResult,
+  PluginSyncFileMapping,
+  PluginSyncOperation,
+  PluginEnvironmentSyncInParams,
+  PluginEnvironmentSyncOutParams,
+  PluginEnvironmentSyncResult,
   PluginEnvironmentInteractiveSetupStatus,
   PluginEnvironmentInteractiveSetupConnectionType,
   PluginEnvironmentTemplateRefKind,
@@ -304,6 +309,7 @@ export type {
   PluginDatabaseClient,
   HumanCompanyMembershipRole,
   MembershipStatus,
+  EnvSecretRefBinding,
 } from "./types.js";
 
 // Manifest and constant types re-exported from @paperclipai/shared

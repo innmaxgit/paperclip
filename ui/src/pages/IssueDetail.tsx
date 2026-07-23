@@ -2,7 +2,6 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState, type ChangeEve
 import { pickTextColorForPillBg } from "@/lib/color-contrast";
 import { Link, useLocation, useNavigate, useNavigationType, useParams } from "@/lib/router";
 import { useInfiniteQuery, useQuery, useMutation, useQueryClient, type InfiniteData, type QueryClient } from "@tanstack/react-query";
-import { useVisibilityRefetchInterval } from "@/lib/polling";
 import { usePublishSharedQueryData, useSharedPollingQuery } from "@/hooks/useSharedPolling";
 import { ApiError } from "../api/client";
 import { issuesApi } from "../api/issues";
@@ -42,8 +41,13 @@ import {
 import { resolveIssueActiveRun, shouldTrackIssueActiveRun } from "../lib/issueActiveRun";
 import { getIssueDetailQueryOptions } from "../lib/issueDetailCache";
 import {
+  beginLocalInboxArchive,
+  boundLocalInboxArchive,
   cancelInboxIssueQueries,
+  clearLocalInboxArchive,
+  confirmLocalInboxArchive,
   invalidateInboxIssueQueries,
+  getIssuePresenceInActiveInboxCaches,
   removeIssueFromInboxCaches,
   restoreIssueToInboxCaches,
   snapshotInboxIssueCaches,
@@ -76,6 +80,7 @@ import {
 import { clearIssueExecutionRun, removeLiveRunById, upsertInterruptedRun } from "../lib/optimistic-issue-runs";
 import { useProjectOrder } from "../hooks/useProjectOrder";
 import { relativeTime, cn, formatDurationMs, formatTokens, visibleRunCostUsd } from "../lib/utils";
+import { liveBlueBadge } from "../lib/status-colors";
 import { ApprovalCard } from "../components/ApprovalCard";
 import { InlineEditor } from "../components/InlineEditor";
 import {
@@ -102,7 +107,11 @@ import { IssuesList } from "../components/IssuesList";
 import { AgentIcon } from "../components/AgentIconPicker";
 import { IssueReferenceActivitySummary } from "../components/IssueReferenceActivitySummary";
 import { IssueRelatedWorkPanel } from "../components/IssueRelatedWorkPanel";
-import { IssueMonitorActivityCard } from "../components/IssueMonitorActivityCard";
+import {
+  IssueMonitorBanner,
+  IssueMonitorComposerStrip,
+  hasVisibleMonitorSurface,
+} from "../components/IssueMonitorBanner";
 import { IssueScheduledRetryCard } from "../components/IssueScheduledRetryCard";
 import { IssueProperties } from "../components/IssueProperties";
 import { PauseAffectsSummaryView } from "../components/interrupt-handoff/InterruptHandoffViews";
@@ -198,6 +207,8 @@ import {
   type IssueThreadInteraction,
   type RequestCheckboxConfirmationInteraction,
   type RequestConfirmationInteraction,
+  type RequestItemVerdictsInteraction,
+  type RequestItemVerdictValue,
   type SuggestTasksInteraction,
   type IssueTreeControlMode,
   type WorkspaceFileRef,
@@ -314,12 +325,19 @@ export function shouldScrollIssueDetailToTopOnNavigation(input: {
   return input.previousIssueId !== input.nextIssueId;
 }
 
-function resolveRunningIssueRun(
+function resolveInterruptibleIssueRun(
   activeRun: ActiveRunForIssue | null | undefined,
   liveRuns: readonly LiveRunForIssue[] | undefined,
 ) {
-  const runningLiveRun = (liveRuns ?? []).find((run) => run.status === "running") ?? null;
-  return runningLiveRun ?? (activeRun?.status === "running" ? activeRun : null);
+  const issueLiveRun =
+    (liveRuns ?? []).find((run) => run.status === "running") ??
+    (liveRuns ?? []).find((run) => run.status === "queued") ??
+    null;
+  return issueLiveRun ?? (
+    activeRun?.status === "running" || activeRun?.status === "queued"
+      ? activeRun
+      : null
+  );
 }
 
 function dedupeLiveRunsById(liveRuns: readonly LiveRunForIssue[]) {
@@ -352,7 +370,7 @@ function readIssueRunStateFromCache(
   return {
     liveRuns,
     activeRun: resolvedActiveRun,
-    runningIssueRun: resolveRunningIssueRun(resolvedActiveRun, liveRuns),
+    interruptibleIssueRun: resolveInterruptibleIssueRun(resolvedActiveRun, liveRuns),
   };
 }
 
@@ -874,6 +892,8 @@ type IssueDetailChatTabProps = {
   onRefreshLatestComments: () => Promise<unknown> | void;
   onWorkModeChange?: (workMode: IssueWorkMode) => Promise<void> | void;
   composerRef: Ref<IssueChatComposerHandle>;
+  /** Optional node rendered inline directly above the reply composer (e.g. the monitor strip). */
+  composerAccessory?: ReactNode;
   footer?: ReactNode;
   feedbackVotes?: FeedbackVote[];
   feedbackDataSharingPreference: "allowed" | "not_allowed" | "prompt";
@@ -917,6 +937,10 @@ type IssueDetailChatTabProps = {
     answers: AskUserQuestionsAnswer[],
   ) => Promise<void>;
   onCancelInteraction: (interaction: AskUserQuestionsInteraction) => Promise<void>;
+  onSubmitInteractionVerdicts: (
+    interaction: RequestItemVerdictsInteraction,
+    verdicts: { id: string; verdict: RequestItemVerdictValue; reason?: string }[],
+  ) => Promise<void>;
   assigneeUserId: string | null;
   onResumeFromBacklog?: () => Promise<void> | void;
   resumeFromBacklogPending?: boolean;
@@ -957,6 +981,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   onRefreshLatestComments,
   onWorkModeChange,
   composerRef,
+  composerAccessory,
   footer,
   feedbackVotes,
   feedbackDataSharingPreference,
@@ -989,6 +1014,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   onRejectInteraction,
   onSubmitInteractionAnswers,
   onCancelInteraction,
+  onSubmitInteractionVerdicts,
   assigneeUserId,
   onResumeFromBacklog,
   resumeFromBacklogPending,
@@ -1030,8 +1056,8 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
   const resolvedActivity = activity ?? [];
   const resolvedLinkedRuns = linkedRuns ?? [];
 
-  const runningIssueRun = useMemo(
-    () => resolveRunningIssueRun(resolvedActiveRun, resolvedLiveRuns),
+  const interruptibleIssueRun = useMemo(
+    () => resolveInterruptibleIssueRun(resolvedActiveRun, resolvedLiveRuns),
     [resolvedActiveRun, resolvedLiveRuns],
   );
   const liveRunIds = useMemo(() => {
@@ -1051,7 +1077,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     }));
   }, [liveRunIds, resolvedLinkedRuns]);
   const commentsWithRunMeta = useMemo<IssueDetailComment[]>(() => {
-    const activeRunStartedAt = runningIssueRun?.startedAt ?? runningIssueRun?.createdAt ?? null;
+    const activeRunStartedAt = interruptibleIssueRun?.startedAt ?? interruptibleIssueRun?.createdAt ?? null;
     const runMetaByCommentId = new Map<string, { runId: string; runAgentId: string | null; interruptedRunId: string | null }>();
     const followUpCommentIds = new Set<string>();
     const agentIdByRunId = new Map<string, string>();
@@ -1092,7 +1118,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       const locallyQueuedComment = applyLocalQueuedIssueCommentState(nextComment, {
         queuedTargetRunId,
         targetRunIsLive: queuedTargetRunId ? liveRunIds.has(queuedTargetRunId) : false,
-        runningRunId: runningIssueRun?.id ?? null,
+        runningRunId: interruptibleIssueRun?.id ?? null,
       });
       if (locallyQueuedComment !== nextComment) {
         return locallyQueuedComment;
@@ -1101,9 +1127,9 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         isQueuedIssueComment({
           comment: nextComment,
           activeRunStartedAt,
-          activeRunAgentId: runningIssueRun?.agentId ?? null,
-          activeRunCommentId: runningIssueRun?.contextCommentId ?? null,
-          activeRunWakeCommentId: runningIssueRun?.contextWakeCommentId ?? null,
+          activeRunAgentId: interruptibleIssueRun?.agentId ?? null,
+          activeRunCommentId: interruptibleIssueRun?.contextCommentId ?? null,
+          activeRunWakeCommentId: interruptibleIssueRun?.contextWakeCommentId ?? null,
           runId: meta?.runId ?? nextComment.runId ?? null,
           interruptedRunId: meta?.interruptedRunId ?? nextComment.interruptedRunId ?? null,
         })
@@ -1111,7 +1137,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
         return {
           ...nextComment,
           queueState: "queued" as const,
-          queueTargetRunId: runningIssueRun?.id ?? nextComment.queueTargetRunId ?? null,
+          queueTargetRunId: interruptibleIssueRun?.id ?? nextComment.queueTargetRunId ?? null,
           queueReason: queuedCommentReason,
         };
       }
@@ -1124,7 +1150,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     queuedCommentReason,
     resolvedActivity,
     resolvedLinkedRuns,
-    runningIssueRun,
+    interruptibleIssueRun,
   ]);
   const timelineEvents = useMemo(
     () => extractIssueTimelineEvents(resolvedActivity),
@@ -1148,6 +1174,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       ) : null}
       <ThreadComponent
         composerRef={composerRef}
+        composerAccessory={composerAccessory}
         comments={commentsWithRunMeta}
         interactions={interactions}
         feedbackVotes={feedbackVotes}
@@ -1210,11 +1237,12 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
           onSubmitInteractionAnswers(interaction, answers)
         }
         onCancelInteraction={onCancelInteraction}
+        onSubmitInteractionVerdicts={onSubmitInteractionVerdicts}
         issueWorkMode={issueWorkMode}
         onWorkModeChange={onWorkModeChange}
-        onCancelRun={runningIssueRun && onPauseWorkRun
+        onCancelRun={interruptibleIssueRun && onPauseWorkRun
           ? async () => {
-              await onPauseWorkRun(runningIssueRun.id);
+              await onPauseWorkRun(interruptibleIssueRun.id);
             }
           : undefined}
         onImageClick={onImageClick}
@@ -1242,8 +1270,6 @@ type IssueDetailActivityTabProps = {
   userProfileMap: Map<string, import("../lib/company-members").CompanyUserProfile>;
   pendingApprovalAction: { approvalId: string; action: "approve" | "reject" } | null;
   onApprovalAction: (approvalId: string, action: "approve" | "reject") => void;
-  onCheckMonitorNow: () => void;
-  checkingMonitorNow: boolean;
   handoffFocusSignal?: number;
   externalReferences?: MarkdownExternalReferenceMap;
 };
@@ -1260,8 +1286,6 @@ function IssueDetailActivityTab({
   userProfileMap,
   pendingApprovalAction,
   onApprovalAction,
-  onCheckMonitorNow,
-  checkingMonitorNow,
   handoffFocusSignal = 0,
   externalReferences,
 }: IssueDetailActivityTabProps) {
@@ -1492,11 +1516,7 @@ function IssueDetailActivityTab({
         </div>
       )}
       <IssueScheduledRetryCard issueId={issue.id} scheduledRetry={issue.scheduledRetry ?? null} />
-      <IssueMonitorActivityCard
-        issue={issue}
-        onCheckNow={onCheckMonitorNow}
-        checkingNow={checkingMonitorNow}
-      />
+      {/* Waiting-monitor state now lives in the pinned top banner (IssueMonitorBanner) — PAP-14557 decision 1. */}
     </>
   );
 }
@@ -1675,14 +1695,14 @@ export function IssueDetail() {
     queryFn: () => issuesApi.list(resolvedCompanyId!, { parentId: issue!.parentId!, includeBlockedBy: true }),
     enabled: !!resolvedCompanyId && !!issue?.parentId,
   });
-  const companyLiveRunsRefetchInterval = useVisibilityRefetchInterval({ visibleMs: 5000 });
   const companyLiveRunsQueryKey = resolvedCompanyId ? queryKeys.liveRuns(resolvedCompanyId) : ["live-runs", "pending"] as const;
   const sharedCompanyLiveRuns = useSharedPollingQuery<LiveRunForIssue[]>({
     companyId: resolvedCompanyId,
     resourceKey: "live-runs",
     queryKey: companyLiveRunsQueryKey,
     enabled: !!resolvedCompanyId,
-    refetchInterval: companyLiveRunsRefetchInterval,
+    // Event-sourced via LiveUpdatesProvider (#9627); no interval poll needed.
+    refetchInterval: false,
     leaderOnly: true,
   });
   const { data: companyLiveRuns, dataUpdatedAt: companyLiveRunsUpdatedAt } = useQuery({
@@ -2407,7 +2427,9 @@ export function IssueDetail() {
       await queryClient.cancelQueries({ queryKey: queryKeys.issues.detail(issueId!) });
 
       const previousIssue = queryClient.getQueryData<Issue>(queryKeys.issues.detail(issueId!));
-      const queuedComment = !interrupt ? readIssueRunStateFromCache(queryClient, issueId!, issue).runningIssueRun : null;
+      const queuedComment = !interrupt
+        ? readIssueRunStateFromCache(queryClient, issueId!, issue).interruptibleIssueRun
+        : null;
       const optimisticComment = issue
         ? createOptimisticIssueComment({
             companyId: issue.companyId,
@@ -2588,6 +2610,38 @@ export function IssueDetail() {
     },
   });
 
+  const submitInteractionVerdicts = useMutation({
+    mutationFn: ({
+      interaction,
+      verdicts,
+    }: {
+      interaction: RequestItemVerdictsInteraction;
+      verdicts: { id: string; verdict: RequestItemVerdictValue; reason?: string }[];
+    }) => issuesApi.submitInteractionVerdicts(issueId!, interaction.id, verdicts),
+    onSuccess: (interaction, variables) => {
+      upsertInteractionInCache(interaction);
+      invalidateIssueDetail();
+      invalidateIssueCollections();
+      const applied = variables.verdicts.length;
+      const complete = interaction.kind === "request_item_verdicts"
+        ? interaction.result?.complete ?? false
+        : false;
+      pushToast({
+        title: complete
+          ? "All verdicts applied"
+          : `Applied ${applied} decision${applied === 1 ? "" : "s"}`,
+        tone: "success",
+      });
+    },
+    onError: (err) => {
+      pushToast({
+        title: "Apply failed",
+        body: err instanceof Error ? err.message : "Unable to apply the verdicts",
+        tone: "error",
+      });
+    },
+  });
+
   const cancelInteraction = useMutation({
     mutationFn: ({ interaction }: { interaction: AskUserQuestionsInteraction }) =>
       issuesApi.cancelInteraction(issueId!, interaction.id),
@@ -2633,7 +2687,9 @@ export function IssueDetail() {
       await queryClient.cancelQueries({ queryKey: queryKeys.issues.detail(issueId!) });
 
       const previousIssue = queryClient.getQueryData<Issue>(queryKeys.issues.detail(issueId!));
-      const queuedComment = !interrupt ? readIssueRunStateFromCache(queryClient, issueId!, issue).runningIssueRun : null;
+      const queuedComment = !interrupt
+        ? readIssueRunStateFromCache(queryClient, issueId!, issue).interruptibleIssueRun
+        : null;
       const optimisticComment = issue
         ? createOptimisticIssueComment({
             companyId: issue.companyId,
@@ -2753,11 +2809,11 @@ export function IssueDetail() {
         previousRunState.find((state) => state.activeRun)?.activeRun ??
         null;
       const liveRunList = dedupeLiveRunsById(previousRunState.flatMap((state) => state.liveRuns ?? []));
-      const runningIssueRun = resolveRunningIssueRun(cachedActiveRun, liveRunList);
+      const interruptibleIssueRun = resolveInterruptibleIssueRun(cachedActiveRun, liveRunList);
       const targetRun =
         cachedActiveRun?.id === runId
           ? cachedActiveRun
-          : liveRunList?.find((run) => run.id === runId) ?? runningIssueRun ?? null;
+          : liveRunList?.find((run) => run.id === runId) ?? interruptibleIssueRun ?? null;
 
       if (targetRun) {
         const interruptedAt = new Date().toISOString();
@@ -3017,10 +3073,11 @@ export function IssueDetail() {
     mutationFn: (id: string) => issuesApi.archiveFromInbox(id),
     onMutate: async (id) => {
       if (!selectedCompanyId) return { previousData: [] as InboxIssueCacheSnapshot };
+      beginLocalInboxArchive(selectedCompanyId, id);
       await cancelInboxIssueQueries(queryClient, selectedCompanyId);
       const previousData = snapshotInboxIssueCaches(queryClient, selectedCompanyId);
       removeIssueFromInboxCaches(queryClient, selectedCompanyId, id);
-      return { previousData };
+      return { companyId: selectedCompanyId, previousData };
     },
     onSuccess: (_data, id) => {
       if (selectedCompanyId) {
@@ -3031,6 +3088,7 @@ export function IssueDetail() {
       pushToast({ title: "Task archived from inbox", tone: "success" });
     },
     onError: (err, id, context) => {
+      if (context?.companyId) clearLocalInboxArchive(context.companyId, id);
       if (context?.previousData) {
         restoreIssueToInboxCaches(queryClient, context.previousData, id);
       }
@@ -3040,8 +3098,14 @@ export function IssueDetail() {
         tone: "error",
       });
     },
-    onSettled: () => {
-      if (selectedCompanyId) invalidateInboxIssueQueries(queryClient, selectedCompanyId);
+    onSettled: async (_data, error, id, context) => {
+      if (!context?.companyId) return;
+      if (!error) boundLocalInboxArchive(context.companyId, id);
+      await invalidateInboxIssueQueries(queryClient, context.companyId);
+      if (!error) {
+        const presence = getIssuePresenceInActiveInboxCaches(queryClient, context.companyId, id);
+        if (presence !== "unknown") confirmLocalInboxArchive(context.companyId, id);
+      }
     },
   });
 
@@ -3123,6 +3187,8 @@ export function IssueDetail() {
         externalObjectsLoading={externalObjectsState.isEnabled ? externalObjectsState.isLoading : undefined}
         externalObjectsError={externalObjectsState.isEnabled ? externalObjectsState.isError : undefined}
         onRetryExternalObjects={externalObjectsState.isEnabled ? externalObjectsState.refetch : undefined}
+        onCheckMonitorNow={() => checkIssueMonitorNow.mutate()}
+        checkingMonitorNow={checkIssueMonitorNow.isPending}
       />
     );
     return () => closePanel();
@@ -3135,6 +3201,8 @@ export function IssueDetail() {
     panelChildIssues,
     panelIssue,
     resolvedHasActiveRun,
+    checkIssueMonitorNow.isPending,
+    checkIssueMonitorNow.mutate,
     externalObjectsState.isEnabled,
     externalObjectsState.groups,
     externalObjectsState.isLoading,
@@ -3589,6 +3657,12 @@ export function IssueDetail() {
   const handleCancelInteraction = useCallback(async (interaction: AskUserQuestionsInteraction) => {
     await cancelInteraction.mutateAsync({ interaction });
   }, [cancelInteraction]);
+  const handleSubmitInteractionVerdicts = useCallback(async (
+    interaction: RequestItemVerdictsInteraction,
+    verdicts: { id: string; verdict: RequestItemVerdictValue; reason?: string }[],
+  ) => {
+    await submitInteractionVerdicts.mutateAsync({ interaction, verdicts });
+  }, [submitInteractionVerdicts]);
   const canResumeFromBacklog = issue?.status === "backlog" && Boolean(issue.assigneeAgentId || issue.assigneeUserId);
   const handleResumeFromBacklog = useCallback(async () => {
     await updateIssue.mutateAsync({ status: "todo" });
@@ -4112,7 +4186,7 @@ export function IssueDetail() {
           <span className="text-sm font-mono text-muted-foreground shrink-0">{issue.identifier ?? issue.id.slice(0, 8)}</span>
 
           {hasLiveRuns && (
-            <Badge variant="outline" className="gap-1.5 bg-blue-500/10 border-blue-500/30 text-(length:--text-nano) text-blue-600 dark:text-blue-400">
+            <Badge variant="outline" className={cn("gap-1.5 text-(length:--text-nano)", liveBlueBadge)}>
               <span className="relative flex h-1.5 w-1.5">
                 <span className="animate-pulse absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
                 <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-blue-500" />
@@ -4421,6 +4495,12 @@ export function IssueDetail() {
           className="text-xl font-bold"
         />
 
+        <IssueMonitorBanner
+          issue={issue}
+          onCheckNow={() => checkIssueMonitorNow.mutate()}
+          checkingNow={checkIssueMonitorNow.isPending}
+        />
+
         <InlineEditor
           value={issue.description ?? ""}
           onSave={(description) => updateIssue.mutateAsync({ description })}
@@ -4696,6 +4776,15 @@ export function IssueDetail() {
               onLoadOlderComments={loadOlderComments}
               onRefreshLatestComments={refetchLatestComments}
               composerRef={commentComposerRef}
+              composerAccessory={
+                hasVisibleMonitorSurface(issue) ? (
+                  <IssueMonitorComposerStrip
+                    issue={issue}
+                    onCheckNow={() => checkIssueMonitorNow.mutate()}
+                    checkingNow={checkIssueMonitorNow.isPending}
+                  />
+                ) : null
+              }
               footer={
                 siblingNavigation ? (
                   <IssueSiblingNavigation
@@ -4742,6 +4831,7 @@ export function IssueDetail() {
               onRejectInteraction={handleRejectInteraction}
               onSubmitInteractionAnswers={handleSubmitInteractionAnswers}
               onCancelInteraction={handleCancelInteraction}
+              onSubmitInteractionVerdicts={handleSubmitInteractionVerdicts}
               assigneeUserId={issue.assigneeUserId ?? null}
               onResumeFromBacklog={canResumeFromBacklog ? handleResumeFromBacklog : undefined}
               resumeFromBacklogPending={
@@ -4770,8 +4860,6 @@ export function IssueDetail() {
               onApprovalAction={(approvalId, action) => {
                 approvalDecision.mutate({ approvalId, action });
               }}
-              onCheckMonitorNow={() => checkIssueMonitorNow.mutate()}
-              checkingMonitorNow={checkIssueMonitorNow.isPending}
               externalReferences={externalObjectsState.isEnabled ? externalObjectsState.markdownReferences : undefined}
             />
           ) : null}
@@ -4977,6 +5065,8 @@ export function IssueDetail() {
                 externalObjectsLoading={externalObjectsState.isEnabled ? externalObjectsState.isLoading : undefined}
                 externalObjectsError={externalObjectsState.isEnabled ? externalObjectsState.isError : undefined}
                 onRetryExternalObjects={externalObjectsState.isEnabled ? externalObjectsState.refetch : undefined}
+                onCheckMonitorNow={() => checkIssueMonitorNow.mutate()}
+                checkingMonitorNow={checkIssueMonitorNow.isPending}
               />
             </div>
           </ScrollArea>

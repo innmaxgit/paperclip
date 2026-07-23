@@ -34,7 +34,7 @@ Notes:
     "canary" and create the git tag canary/vYYYY.MDD.P-canary.N.
   - Stable releases publish YYYY.MDD.P under the npm dist-tag "latest" and
     create the git tag vYYYY.MDD.P.
-  - Stable release notes must already exist at releases/vYYYY.MDD.P.md.
+  - Non-dry-run stable release notes must already exist at releases/vYYYY.MDD.P.md.
   - The script rewrites versions temporarily and restores the working tree on
     exit. Tags always point at the original source commit, not a generated
     release commit.
@@ -166,7 +166,7 @@ NOTES_FILE="$(release_notes_file "$TARGET_STABLE_VERSION")"
 require_clean_worktree
 require_npm_publish_auth "$dry_run"
 
-if [ "$channel" = "stable" ] && [ ! -f "$NOTES_FILE" ]; then
+if [ "$channel" = "stable" ] && [ "$dry_run" = false ] && [ ! -f "$NOTES_FILE" ]; then
   release_fail "stable release notes file is required at $NOTES_FILE before publishing stable."
 fi
 
@@ -257,7 +257,16 @@ if [ "$dry_run" = true ]; then
     [ -z "$pkg_dir" ] && continue
     release_info "  --- $pkg_dir ---"
     cd "$REPO_ROOT/$pkg_dir"
-    pnpm publish --dry-run --no-git-checks --tag "$DIST_TAG" 2>&1 | tail -3
+    publish_tool="$(package_publish_tool)"
+    if [ "$publish_tool" = "npm" ]; then
+      publish_dir="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-release-package.XXXXXX")"
+      node "$REPO_ROOT/scripts/prepare-bundled-package.mjs" "$REPO_ROOT/$pkg_dir" "$publish_dir"
+      cd "$publish_dir"
+      run_bundled_npm_pack pack --pack-destination "$publish_dir" 2>&1 | tail -3
+      rm -rf "$publish_dir"
+    else
+      pnpm publish --dry-run --no-git-checks --tag "$DIST_TAG" 2>&1 | tail -3
+    fi
   done <<< "$VERSIONED_PACKAGE_INFO"
   release_info "  [dry-run] Would create git tag $tag_name on $CURRENT_SHA"
 else
@@ -266,7 +275,16 @@ else
     [ -z "$pkg_dir" ] && continue
     release_info "  Publishing $pkg_name@$pkg_version"
     cd "$REPO_ROOT/$pkg_dir"
-    publish_package_to_npm "$DIST_TAG" "$pkg_name" "$pkg_version"
+    publish_tool="$(package_publish_tool)"
+    if [ "$publish_tool" = "npm" ]; then
+      publish_dir="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-release-package.XXXXXX")"
+      node "$REPO_ROOT/scripts/prepare-bundled-package.mjs" "$REPO_ROOT/$pkg_dir" "$publish_dir"
+      cd "$publish_dir"
+    fi
+    publish_package_to_npm "$DIST_TAG" "$pkg_name" "$pkg_version" "$publish_tool"
+    if [ "$publish_tool" = "npm" ]; then
+      rm -rf "$publish_dir"
+    fi
   done <<< "$VERSIONED_PACKAGE_INFO"
   release_info "  ✓ Published all packages under dist-tag $DIST_TAG"
 fi

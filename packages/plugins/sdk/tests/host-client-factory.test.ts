@@ -9,6 +9,65 @@ import {
 import { PLUGIN_RPC_ERROR_CODES } from "../src/protocol.js";
 
 describe("createHostClientHandlers invocation company scope", () => {
+  it("rejects worker-selected config and secret company ids without a host invocation scope", async () => {
+    const configGet = vi.fn(async () => ({ apiKeyRef: "unreachable" }));
+    const secretsResolve = vi.fn(async () => "unreachable");
+    const services = {
+      config: { get: configGet },
+      secrets: { resolve: secretsResolve },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+
+    await expect(
+      handlers["config.get"]({ companyId: "company-a" }),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    await expect(
+      handlers["secrets.resolve"]({
+        companyId: "company-a",
+        secretRef: { type: "secret_ref", secretId: "secret-a" },
+      }),
+    ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
+    expect(configGet).not.toHaveBeenCalled();
+    expect(secretsResolve).not.toHaveBeenCalled();
+  });
+
+  it("allows explicit config and secret company ids only when they match the host invocation scope", async () => {
+    const configGet = vi.fn(async () => ({ apiKeyRef: "ref" }));
+    const secretsResolve = vi.fn(async () => "resolved");
+    const services = {
+      config: { get: configGet },
+      secrets: { resolve: secretsResolve },
+    } as unknown as HostServices;
+
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["secrets.read-ref"],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      handlers["config.get"]({ companyId: "company-a" }, context),
+    ).resolves.toEqual({ apiKeyRef: "ref" });
+    await expect(
+      handlers["secrets.resolve"]({
+        companyId: "company-a",
+        secretRef: { type: "secret_ref", secretId: "secret-a" },
+      }, context),
+    ).resolves.toBe("resolved");
+
+    expect(configGet).toHaveBeenCalledWith({ companyId: "company-a" }, context);
+    expect(secretsResolve).toHaveBeenCalledWith({
+      companyId: "company-a",
+      secretRef: { type: "secret_ref", secretId: "secret-a" },
+    }, context);
+  });
+
   it("rejects company-scoped host calls outside the current invocation company", async () => {
     const projectsList = vi.fn(async () => []);
     const services = {
@@ -171,5 +230,79 @@ describe("createHostClientHandlers invocation company scope", () => {
       ),
     ).rejects.toBeInstanceOf(InvocationScopeDeniedError);
     expect(searchAudit).not.toHaveBeenCalled();
+  });
+
+  it("rejects a human-attributed createComment call when only issue.comments.create is granted", async () => {
+    const createComment = vi.fn(async () => ({ id: "comment-1" }));
+    const services = {
+      issues: { createComment },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["issue.comments.create"],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      handlers["issues.createComment"]({
+        issueId: "issue-a",
+        body: "hello",
+        companyId: "company-a",
+        actorUserId: "user-a",
+      }, context),
+    ).rejects.toBeInstanceOf(CapabilityDeniedError);
+    expect(createComment).not.toHaveBeenCalled();
+  });
+
+  it("allows a human-attributed createComment call once issue.comments.create_human_attributed is also granted", async () => {
+    const createComment = vi.fn(async () => ({ id: "comment-1" }));
+    const services = {
+      issues: { createComment },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["issue.comments.create", "issue.comments.create_human_attributed"],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      handlers["issues.createComment"]({
+        issueId: "issue-a",
+        body: "hello",
+        companyId: "company-a",
+        actorUserId: "user-a",
+      }, context),
+    ).resolves.toEqual({ id: "comment-1" });
+    expect(createComment).toHaveBeenCalledWith({
+      issueId: "issue-a",
+      body: "hello",
+      companyId: "company-a",
+      actorUserId: "user-a",
+    });
+  });
+
+  it("still allows a plain agent-attributed createComment call without the human-attribution capability", async () => {
+    const createComment = vi.fn(async () => ({ id: "comment-2" }));
+    const services = {
+      issues: { createComment },
+    } as unknown as HostServices;
+    const handlers = createHostClientHandlers({
+      pluginId: "paperclip.test",
+      capabilities: ["issue.comments.create"],
+      services,
+    });
+    const context = { invocationScope: { companyId: "company-a" } };
+
+    await expect(
+      handlers["issues.createComment"]({
+        issueId: "issue-a",
+        body: "hello",
+        companyId: "company-a",
+        authorAgentId: "agent-a",
+      }, context),
+    ).resolves.toEqual({ id: "comment-2" });
+    expect(createComment).toHaveBeenCalled();
   });
 });

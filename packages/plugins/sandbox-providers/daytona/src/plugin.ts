@@ -31,9 +31,13 @@ import type {
   PluginEnvironmentReleaseLeaseParams,
   PluginEnvironmentResumeLeaseParams,
   PluginEnvironmentStartInteractiveSetupParams,
+  PluginEnvironmentSyncInParams,
+  PluginEnvironmentSyncOutParams,
+  PluginEnvironmentSyncResult,
   PluginEnvironmentValidateConfigParams,
   PluginEnvironmentValidationResult,
 } from "@paperclipai/plugin-sdk";
+import { performSyncIn, performSyncOut } from "./file-sync.js";
 
 interface DaytonaDriverConfig {
   apiKey: string | null;
@@ -51,6 +55,7 @@ interface DaytonaDriverConfig {
   autoArchiveInterval: number | null;
   autoDeleteInterval: number | null;
   reuseLease: boolean;
+  archiveOnRelease: boolean;
 }
 
 type WorkspaceSentinelResult = {
@@ -92,6 +97,12 @@ const WORKSPACE_SENTINEL_RELATIVE_PATH = ".paperclip-runtime/reusable-sandbox-le
 const DEFAULT_AUTO_STOP_INTERVAL_MINUTES = 15;
 const DEFAULT_AUTO_ARCHIVE_INTERVAL_MINUTES = 60;
 const DEFAULT_AUTO_DELETE_INTERVAL_MINUTES = 7 * 24 * 60; // 7 days
+
+// Sandboxes released with `archiveOnRelease` (test/probe runs) are archived so
+// operators can inspect them from the Daytona dashboard, then expired by
+// Daytona itself after this interval (counted from the stop that precedes the
+// archive) so debugging copies don't accumulate.
+const ARCHIVE_ON_RELEASE_AUTO_DELETE_MINUTES = 60;
 
 // Fail-fast cap for git network operations (push, fetch, pull, ls-remote, etc.)
 // so a stalled remote or missing credential never consumes the full 900 s adapter
@@ -145,6 +156,7 @@ function parseDriverConfig(raw: Record<string, unknown>): DaytonaDriverConfig {
     autoArchiveInterval: parseOptionalInteger(raw.autoArchiveInterval) ?? DEFAULT_AUTO_ARCHIVE_INTERVAL_MINUTES,
     autoDeleteInterval: parseOptionalInteger(raw.autoDeleteInterval) ?? DEFAULT_AUTO_DELETE_INTERVAL_MINUTES,
     reuseLease: raw.reuseLease === true,
+    archiveOnRelease: raw.archiveOnRelease === true,
   };
 }
 
@@ -434,6 +446,9 @@ function leaseMetadata(input: {
     target: input.sandbox.target,
     timeoutMs: input.config.timeoutMs,
     reuseLease: input.config.reuseLease,
+    // Persisted so the release path (which rebuilds config from lease
+    // metadata) still knows to archive instead of delete.
+    ...(input.config.archiveOnRelease ? { archiveOnRelease: true } : {}),
     remoteCwd: input.remoteCwd,
     resumedLease: input.resumedLease,
     // Record the resources Paperclip attempted to request so future diagnosis
@@ -653,6 +668,17 @@ function buildLoginShellScript(input: {
   }
   lines.push(finalLine);
   return lines.join(" && ");
+}
+
+// The workspace remote dir is the confinement root for native file sync. It is
+// recorded on the lease metadata at acquire/resume time; require it so a sync can
+// never run without a concrete root to confine every sandbox path against.
+function resolveSyncRemoteDir(lease: { metadata?: Record<string, unknown> | null }): string {
+  const remoteCwd = lease.metadata?.remoteCwd;
+  if (typeof remoteCwd === "string" && remoteCwd.trim().length > 0) {
+    return remoteCwd.trim();
+  }
+  throw new Error("Daytona file sync requires a workspace remote dir on the lease metadata.");
 }
 
 async function createSandbox(
@@ -890,7 +916,14 @@ const plugin = definePlugin({
       });
       return {
         providerLeaseId: sandbox.id,
-        metadata: leaseMetadata({ config, sandbox, shellCommand, remoteCwd, resumedLease: false, workspaceSentinel }),
+        metadata: leaseMetadata({
+          config,
+          sandbox,
+          shellCommand,
+          remoteCwd,
+          resumedLease: false,
+          workspaceSentinel,
+        }),
       };
     } catch (error) {
       await sandbox.delete(toTimeoutSeconds(config.timeoutMs)).catch(() => undefined);
@@ -922,7 +955,14 @@ const plugin = definePlugin({
       const shellCommand = await detectSandboxShellCommand(sandbox, toTimeoutSeconds(config.timeoutMs));
       return {
         providerLeaseId: sandbox.id,
-        metadata: leaseMetadata({ config, sandbox, shellCommand, remoteCwd, resumedLease: true, workspaceSentinel }),
+        metadata: leaseMetadata({
+          config,
+          sandbox,
+          shellCommand,
+          remoteCwd,
+          resumedLease: true,
+          workspaceSentinel,
+        }),
       };
     } catch (error) {
       await sandbox.delete(toTimeoutSeconds(config.timeoutMs)).catch(() => undefined);
@@ -954,6 +994,21 @@ const plugin = definePlugin({
         }
       }
       return;
+    }
+
+    if (config.archiveOnRelease) {
+      try {
+        if (sandbox.state !== "stopped") {
+          await sandbox.stop(toTimeoutSeconds(config.timeoutMs));
+        }
+        await sandbox.setAutoDeleteInterval(ARCHIVE_ON_RELEASE_AUTO_DELETE_MINUTES);
+        await sandbox.archive();
+        return;
+      } catch (error) {
+        console.warn(
+          `Failed to archive Daytona sandbox during lease release: ${formatErrorMessage(error)}. Falling back to delete.`,
+        );
+      }
     }
 
     await sandbox.delete(toTimeoutSeconds(config.timeoutMs));
@@ -1204,6 +1259,51 @@ const plugin = definePlugin({
     const sandbox = await getSandbox(config, params.lease.providerLeaseId);
     await ensureSandboxStarted(sandbox, toTimeoutSeconds(resolveTimeoutMs(params.timeoutMs, config)));
     return await executeOneShot(sandbox, params, config);
+  },
+
+  // Opt-in native inbound transfer. Defining this hook (with onEnvironmentSyncOut)
+  // makes the worker advertise `environmentSyncIn`/`environmentSyncOut`, so the
+  // host runner routes Daytona workspace/asset transfers through the SDK's batch
+  // `uploadFiles` (plus host-side tarballs for directories) instead of the
+  // base64-over-exec fallback. Providers that do not define these keep the
+  // byte-identical fallback.
+  async onEnvironmentSyncIn(
+    params: PluginEnvironmentSyncInParams,
+  ): Promise<PluginEnvironmentSyncResult> {
+    if (!params.lease.providerLeaseId) {
+      throw new Error("Daytona syncIn requires a provider lease ID.");
+    }
+    const config = parseDriverConfig(params.config);
+    const remoteDir = resolveSyncRemoteDir(params.lease);
+    const timeoutSeconds = toTimeoutSeconds(config.timeoutMs);
+    const sandbox = await getSandbox(config, params.lease.providerLeaseId);
+    await ensureSandboxStarted(sandbox, timeoutSeconds);
+    return await performSyncIn({
+      sandbox,
+      operations: params.operations,
+      remoteDir,
+      timeoutSeconds,
+    });
+  },
+
+  // Opt-in native outbound transfer. See onEnvironmentSyncIn.
+  async onEnvironmentSyncOut(
+    params: PluginEnvironmentSyncOutParams,
+  ): Promise<PluginEnvironmentSyncResult> {
+    if (!params.lease.providerLeaseId) {
+      throw new Error("Daytona syncOut requires a provider lease ID.");
+    }
+    const config = parseDriverConfig(params.config);
+    const remoteDir = resolveSyncRemoteDir(params.lease);
+    const timeoutSeconds = toTimeoutSeconds(config.timeoutMs);
+    const sandbox = await getSandbox(config, params.lease.providerLeaseId);
+    await ensureSandboxStarted(sandbox, timeoutSeconds);
+    return await performSyncOut({
+      sandbox,
+      operations: params.operations,
+      remoteDir,
+      timeoutSeconds,
+    });
   },
 });
 

@@ -46,6 +46,7 @@ import type {
   PermissionKey,
   PrincipalPermissionGrant,
   PrincipalType,
+  EnvSecretRefBinding,
 } from "@paperclipai/shared";
 import type { PluginPerformActionContext } from "./protocol.js";
 
@@ -138,6 +139,7 @@ export type {
   PermissionKey,
   PrincipalPermissionGrant,
   PrincipalType,
+  EnvSecretRefBinding,
 } from "@paperclipai/shared";
 
 // ---------------------------------------------------------------------------
@@ -426,11 +428,11 @@ export interface PluginExecutionWorkspaceMetadata {
  */
 export interface PluginConfigClient {
   /**
-   * Returns the resolved operator configuration for this plugin instance.
-   * Values are validated against the plugin's `instanceConfigSchema` by the
-   * host before being passed to the worker.
+   * Returns the resolved operator configuration for this plugin in a company.
+   * When called during a host-scoped invocation, the host may derive the
+   * companyId; otherwise callers must pass it explicitly.
    */
-  get(): Promise<Record<string, unknown>>;
+  get(companyId?: string): Promise<Record<string, unknown>>;
 }
 
 export interface PluginLocalFolderProblem {
@@ -642,9 +644,9 @@ export interface PluginHttpClient {
  *
  * Requires `secrets.read-ref` capability.
  *
- * Plugins store secret *references* in their config (e.g. a secret name).
- * This client resolves the reference through the Paperclip secret provider
- * system and returns the resolved value at execution time.
+ * Plugins store shared `{ type: "secret_ref", secretId, version? }` bindings in
+ * company-scoped config. This client resolves a bound ref through the
+ * Paperclip secret provider system at execution time.
  *
  * @see PLUGIN_SPEC.md §22 — Secrets
  */
@@ -652,16 +654,19 @@ export interface PluginSecretsClient {
   /**
    * Resolve a secret reference to its current value.
    *
-   * The reference is a string identifier pointing to a secret configured
-   * in the Paperclip secret provider (e.g. `"MY_API_KEY"`).
+   * The reference must be the shared `secret_ref` object shape from plugin
+   * config. Legacy string UUID references fail closed.
    *
    * Secret values are resolved at call time and must never be cached or
    * written to logs, config, or other persistent storage.
    *
-   * @param secretRef - The secret reference string from plugin config
+   * @param secretRef - The secret reference object from plugin config
    * @returns The resolved secret value
    */
-  resolve(secretRef: string): Promise<string>;
+  resolve(
+    secretRef: string | EnvSecretRefBinding,
+    options?: { companyId?: string; configPath?: string },
+  ): Promise<string>;
 }
 
 /**
@@ -1326,6 +1331,7 @@ export interface PluginIssueSummariesClient {
  * - `issues.orchestration.read` for orchestration summaries
  * - `issue.comments.read` for `listComments`
  * - `issue.comments.create` for `createComment`
+ * - `issue.comments.create_human_attributed` for `createComment` calls that pass `actorUserId`
  * - `issue.interactions.create` for `createInteraction`, `suggestTasks`, `askUserQuestions`, `requestConfirmation`, and `requestCheckboxConfirmation`
  * - `issue.documents.read` for `documents.list` and `documents.get`
  * - `issue.documents.write` for `documents.upsert` and `documents.delete`
@@ -1429,11 +1435,29 @@ export interface PluginIssuesClient {
     } & PluginIssueMutationActor,
   ): Promise<PluginIssueWakeupBatchResult[]>;
   listComments(issueId: string, companyId: string): Promise<IssueComment[]>;
+  /**
+   * Post a comment on an issue.
+   *
+   * Pass `authorAgentId` to attribute the comment to the plugin's own agent
+   * identity (requires `issue.comments.create`, the default).
+   *
+   * Pass `actorUserId` to attribute the comment to a real human instead —
+   * for example, relaying a paired chat user's reply back into the issue
+   * thread. Requires the additional `issue.comments.create_human_attributed`
+   * capability. The host independently verifies that `actorUserId` is an
+   * active human member of the issue's company before applying the
+   * attribution — a plugin can only ever attribute comments to identities
+   * that could have posted them in the web app. A human-attributed comment
+   * also participates in the normal wake-the-assignee behavior a board
+   * user's comment gets in the web app (subject to the same closed-issue /
+   * no-assignee exclusions) — unlike a plugin's own agent-attributed
+   * comments, which never wake anyone.
+   */
   createComment(
     issueId: string,
     body: string,
     companyId: string,
-    options?: { authorAgentId?: string },
+    options?: { authorAgentId?: string; actorUserId?: string },
   ): Promise<IssueComment>;
   createInteraction(
     issueId: string,

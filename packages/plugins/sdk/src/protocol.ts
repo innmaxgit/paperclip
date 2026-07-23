@@ -45,6 +45,7 @@ import type {
   ExternalObjectLivenessState,
   ExternalObjectMentionConfidence,
   ExternalObjectMentionSourceKind,
+  EnvSecretRefBinding,
 } from "@paperclipai/shared";
 export type { PluginLauncherRenderContextSnapshot } from "@paperclipai/shared";
 
@@ -302,7 +303,7 @@ export interface WorkerHostCallContext {
 export interface InitializeParams {
   /** Full plugin manifest snapshot. */
   manifest: PaperclipPluginManifestV1;
-  /** Resolved operator configuration (validated against `instanceConfigSchema`). */
+  /** Bootstrap configuration. Company-scoped config is read via `ctx.config.get(companyId)`. */
   config: Record<string, unknown>;
   /** Instance-level metadata. */
   instanceInfo: {
@@ -333,8 +334,10 @@ export interface InitializeResult {
  * @see PLUGIN_SPEC.md §13.4 — `configChanged`
  */
 export interface ConfigChangedParams {
-  /** The newly resolved configuration. */
+  /** The newly resolved company-scoped configuration. */
   config: Record<string, unknown>;
+  /** Company whose plugin config changed. */
+  companyId?: string | null;
 }
 
 /**
@@ -647,6 +650,66 @@ export interface PluginEnvironmentExecuteResult {
   metadata?: Record<string, unknown>;
 }
 
+/**
+ * A single source→target file or directory transfer within a sync operation.
+ *
+ * For `environmentSyncIn`, `sourcePath` is a host path and `targetPath` is a
+ * sandbox path; for `environmentSyncOut` the direction is reversed. All sandbox
+ * paths are POSIX. The contract is provider-agnostic: a provider may transfer a
+ * directory by whatever native mechanism it prefers (bulk upload, internal tar,
+ * per-file enumeration) as long as the observable result matches this mapping.
+ */
+export interface PluginSyncFileMapping {
+  /** Absolute path of the transfer source (host for syncIn, sandbox for syncOut). */
+  sourcePath: string;
+  /** Absolute path of the transfer target (sandbox for syncIn, host for syncOut). */
+  targetPath: string;
+  /** Whether the mapping transfers a single regular file or a directory tree. */
+  kind: "file" | "directory";
+  /**
+   * POSIX file mode to apply at the target (e.g. `0o600` for secret material).
+   * When set, providers MUST create the target with this mode with no
+   * world-readable window (create-with-mode or chmod-before-bytes, never after).
+   */
+  mode?: number;
+  /** Glob patterns to exclude when `kind` is `"directory"`. */
+  exclude?: string[];
+  /**
+   * Symlink handling for `kind: "directory"` transfers. Falsy preserves symlinks
+   * as links; `true` dereferences them to their target bytes. Mirrors tar's `-h`.
+   */
+  followSymlinks?: boolean;
+}
+
+/**
+ * An ordered, opaque unit of work handed to a sync hook. The `operationId` is an
+ * opaque, non-sensitive token authored by the orchestrator; a provider MUST NOT
+ * interpret it. Operations are applied in array order.
+ */
+export interface PluginSyncOperation {
+  operationId: string;
+  files: PluginSyncFileMapping[];
+}
+
+export interface PluginEnvironmentSyncInParams extends PluginEnvironmentDriverBaseParams {
+  lease: PluginEnvironmentLease;
+  operations: PluginSyncOperation[];
+}
+
+export interface PluginEnvironmentSyncOutParams extends PluginEnvironmentDriverBaseParams {
+  lease: PluginEnvironmentLease;
+  operations: PluginSyncOperation[];
+}
+
+/** Per-operation transfer accounting returned by a sync hook, for observability. */
+export interface PluginEnvironmentSyncResult {
+  operations: {
+    operationId: string;
+    filesTransferred: number;
+    bytesTransferred: number;
+  }[];
+}
+
 export type PluginEnvironmentInteractiveSetupStatus =
   | "starting"
   | "waiting_for_user"
@@ -861,6 +924,14 @@ export interface HostToWorkerMethods {
     params: PluginEnvironmentExecuteParams,
     result: PluginEnvironmentExecuteResult,
   ];
+  environmentSyncIn: [
+    params: PluginEnvironmentSyncInParams,
+    result: PluginEnvironmentSyncResult,
+  ];
+  environmentSyncOut: [
+    params: PluginEnvironmentSyncOutParams,
+    result: PluginEnvironmentSyncResult,
+  ];
   environmentStartInteractiveSetup: [
     params: PluginEnvironmentStartInteractiveSetupParams,
     result: PluginEnvironmentInteractiveSetupSession,
@@ -915,6 +986,8 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] 
   "environmentDestroyLease",
   "environmentRealizeWorkspace",
   "environmentExecute",
+  "environmentSyncIn",
+  "environmentSyncOut",
   "environmentStartInteractiveSetup",
   "environmentGetInteractiveSetup",
   "environmentCaptureTemplate",
@@ -934,7 +1007,7 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] 
  */
 export interface WorkerToHostMethods {
   // Config
-  "config.get": [params: Record<string, never>, result: Record<string, unknown>];
+  "config.get": [params: { companyId?: string }, result: Record<string, unknown>];
 
   // Trusted local folders
   "localFolders.declarations": [
@@ -1071,7 +1144,7 @@ export interface WorkerToHostMethods {
 
   // Secrets
   "secrets.resolve": [
-    params: { secretRef: string },
+    params: { secretRef: string | EnvSecretRefBinding; companyId?: string; configPath?: string },
     result: string,
   ];
 
@@ -1376,7 +1449,14 @@ export interface WorkerToHostMethods {
     result: IssueComment[],
   ];
   "issues.createComment": [
-    params: { issueId: string; body: string; companyId: string; authorAgentId?: string },
+    params: {
+      issueId: string;
+      body: string;
+      companyId: string;
+      authorAgentId?: string;
+      /** Active human company member the comment is attributed to. Requires `issue.comments.create_human_attributed`. */
+      actorUserId?: string;
+    },
     result: IssueComment,
   ];
   "issues.createInteraction": [

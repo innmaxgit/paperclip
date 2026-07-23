@@ -176,7 +176,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
             "Failed to resolve auth session from request headers",
           );
         }
-        if (session?.user?.id) {
+        if (session?.user?.id && session.session?.id) {
           const userId = session.user.id;
           const [roleRow, memberships] = await Promise.all([
             db
@@ -202,6 +202,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           req.actor = {
             type: "board",
             userId,
+            sessionId: session.session.id,
             userName: session.user.name ?? null,
             userEmail: session.user.email ?? null,
             companyIds: memberships.map((row) => row.companyId),
@@ -372,6 +373,19 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
 
     next();
   };
+}
+
+/**
+ * Whether this instance is managed by a Paperclip Cloud control plane.
+ * When the tenant server token is configured, the control plane owns the
+ * user/identity lifecycle for this instance: users arrive through trusted
+ * headers (resolveCloudTenantActor) and are deliberately never granted
+ * instance_admin. Surfaces that assume a self-hosted operator will claim
+ * the instance (e.g. the first-admin bootstrap gate) should treat a
+ * cloud-managed instance as already set up.
+ */
+export function isCloudManagedInstance(): boolean {
+  return Boolean(process.env.PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN?.trim());
 }
 
 export async function resolveCloudTenantActor(db: Db, req: Request): Promise<Express.Request["actor"] | null> {
