@@ -48,6 +48,15 @@ import type {
   InstanceDatabaseBackupTrigger,
 } from "./routes/instance-database-backups.js";
 import {
+  buildRuntimeApiCandidateUrls,
+  choosePrimaryRuntimeApiUrl,
+} from "./runtime-api.js";
+import {
+  parseAdapterRegistryEnv,
+  reconcileAdapterAvailability,
+} from "./services/adapter-registry-bootstrap.js";
+import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
+import {
   applyManagedEnvironments,
   backfillLegacyToolOAuthTokens,
   backfillPrincipalAccessCompatibility,
