@@ -7,10 +7,12 @@ import type {
   EnvironmentLease,
   EnvironmentLeaseStatus,
   ExecutionWorkspace,
+  IssueExecutionWorkspaceSettings,
   PluginEnvironmentConfig,
   SandboxEnvironmentConfig,
 } from "@paperclipai/shared";
 import type {
+  PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentExecuteResult,
   PluginEnvironmentLease,
   PluginEnvironmentRealizeWorkspaceResult,
@@ -123,6 +125,7 @@ export interface EnvironmentDriverAcquireInput {
   heartbeatRunId: string | null;
   executionWorkspaceId: string | null;
   executionWorkspaceMode: ExecutionWorkspace["mode"] | null;
+  executionWorkspaceSettings: IssueExecutionWorkspaceSettings | null;
   /**
    * The harness/adapter type for this run (the agent's adapter). Drivers that
    * materialize a per-run sandbox use it to select the runtime image so a single
@@ -1289,7 +1292,26 @@ function createSandboxEnvironmentDriver(
       const pluginId = readString(input.lease.metadata?.pluginId);
       if (!pluginId) return false;
       const advertised = pluginWorkerManager.getWorker(pluginId)?.supportedMethods ?? [];
-      return advertised.includes("environmentSyncIn") && advertised.includes("environmentSyncOut");
+      if (!advertised.includes("environmentSyncIn") || !advertised.includes("environmentSyncOut")) {
+        return false;
+      }
+      // A worker advertises the sync verbs process-wide, but an individual lease
+      // may run on a backend that has no data channel for the native transport
+      // (e.g. a batch/job backend whose sync hook rejects immediately). The
+      // provider flags such leases so they keep the byte-identical base64
+      // fallback instead of being routed to a hook that would only error.
+      //
+      // Also fall back for any lease persisted with `backend: "job"` directly:
+      // job leases created before `nativeFileSyncUnsupported` existed carry the
+      // backend field but not the flag, and the `job` backend has no pod-exec
+      // channel, so routing them to the native hook would only reject.
+      if (
+        input.lease.metadata?.nativeFileSyncUnsupported === true ||
+        input.lease.metadata?.backend === "job"
+      ) {
+        return false;
+      }
+      return true;
     },
 
     async syncIn(input) {
@@ -1566,7 +1588,8 @@ function createPluginEnvironmentDriver(
         agentId: input.agentId ?? undefined,
         executionWorkspaceId: input.executionWorkspaceId ?? undefined,
         adapterType: input.adapterType ?? undefined,
-      });
+        executionWorkspaceSettings: input.executionWorkspaceSettings,
+      } as PluginEnvironmentAcquireLeaseParams);
 
       return await environmentsSvc.acquireLease({
         companyId: input.companyId,
@@ -1785,6 +1808,7 @@ export function environmentRuntimeService(
       /** Null for ad-hoc invocations (e.g. operator-initiated `Test` probes). */
       heartbeatRunId: string | null;
       persistedExecutionWorkspace: Pick<ExecutionWorkspace, "id" | "mode"> | null;
+      executionWorkspaceSettings?: IssueExecutionWorkspaceSettings | null;
       /** The agent's adapter type for this run (mixed-harness environments). */
       adapterType?: string | null;
       /**
@@ -1810,6 +1834,7 @@ export function environmentRuntimeService(
         heartbeatRunId: input.heartbeatRunId,
         executionWorkspaceId: leaseContext.executionWorkspaceId,
         executionWorkspaceMode: leaseContext.executionWorkspaceMode,
+        executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
         adapterType: input.adapterType ?? null,
         applyCustomImageTemplate: input.applyCustomImageTemplate ?? false,
       });

@@ -375,7 +375,6 @@ export function SidebarProjects() {
 
   const visibleProjects = useMemo(
     () => (projects ?? []).filter((project: Project) => {
-      if (project.archivedAt) return false;
       if (!membershipsQuery.isSuccess) return true;
       return resourceMembershipState(membershipsQuery.data, "project", project.id) !== "left";
     }),
