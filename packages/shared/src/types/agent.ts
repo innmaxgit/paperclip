@@ -50,6 +50,30 @@ export interface AgentInstructionsFileDetail extends AgentInstructionsFileSummar
   content: string;
 }
 
+export interface PermissionEscalationContact {
+  userId: string;
+  name: string | null;
+  email: string | null;
+  membershipRole: string | null;
+  isCompanyOwner: boolean;
+  canManagePermissions: boolean;
+}
+
+/**
+ * Whether the *current caller* may write this bundle, resolved with the same
+ * `agent_config:update` decision the write routes enforce. Present on the
+ * instructions-bundle GET so the editor can go read-only up front instead of
+ * letting someone type a full rewrite and only learn about the 403 on save.
+ */
+export interface AgentInstructionsAccess {
+  canEdit: boolean;
+  canSuggestChanges: boolean;
+  requiredPermissionKey: "agents:configure";
+  deniedReason: string | null;
+  deniedExplanation: string | null;
+  escalationContacts: PermissionEscalationContact[];
+}
+
 export interface AgentInstructionsBundle {
   agentId: string;
   companyId: string;
@@ -63,6 +87,11 @@ export interface AgentInstructionsBundle {
   legacyPromptTemplateActive: boolean;
   legacyBootstrapPromptTemplateActive: boolean;
   files: AgentInstructionsFileSummary[];
+  /**
+   * Only populated by `GET /agents/:id/instructions-bundle`. Mutation responses
+   * omit it — those only succeed for callers who already have the permission.
+   */
+  access?: AgentInstructionsAccess;
 }
 
 export interface AgentAccessState {

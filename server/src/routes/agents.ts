@@ -18,6 +18,7 @@ import {
   resetAgentSessionSchema,
   testAdapterEnvironmentSchema,
   type AgentDesiredSkillEntry,
+  type AgentInstructionsAccess,
   type AgentSkillSnapshot,
   type InstanceSchedulerHeartbeatAgent,
   upsertAgentInstructionsFileSchema,
@@ -72,6 +73,7 @@ import type {
 import { skillVersionSelectionMap } from "../services/runtime-skill-selections.js";
 import { secretService } from "../services/secrets.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
+import { listPermissionEscalationContacts } from "../services/permission-escalation-contacts.js";
 import {
   detectAdapterModel,
   findActiveServerAdapter,
@@ -1486,6 +1488,37 @@ export function agentRoutes(
     );
   }
 
+  /**
+   * Non-throwing mirror of `assertCanManageInstructionsPath`, for read paths
+   * that want to tell the caller up front whether a later write would 403.
+   * Runs the same `agent_config:update` decision the write routes enforce so
+   * the UI gate and the server gate cannot drift apart.
+   */
+  async function resolveInstructionsAccess(
+    req: Request,
+    targetAgent: { id: string; companyId: string },
+  ): Promise<AgentInstructionsAccess> {
+    const decision = await access.decide({
+      actor: req.actor,
+      action: "agent_config:update",
+      resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
+      scope: { requiresChangeGrant: true },
+    });
+    // `deny_missing_consent` means the caller does hold agents:suggest-changes
+    // and is only missing an accepted change consent — not a permission wall.
+    const canSuggestChanges = decision.reason === "deny_missing_consent";
+    return {
+      canEdit: decision.allowed,
+      canSuggestChanges,
+      requiredPermissionKey: "agents:configure",
+      deniedReason: decision.allowed ? null : decision.reason,
+      deniedExplanation: decision.allowed ? null : decision.explanation,
+      escalationContacts: decision.allowed
+        ? []
+        : await listPermissionEscalationContacts(db, targetAgent.companyId),
+    };
+  }
+
   async function assertCanApplyAgentProfileChange(
     req: Request,
     targetAgent: { id: string; companyId: string },
@@ -2837,7 +2870,11 @@ export function agentRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
     await assertCanReadAgent(req, existing);
-    res.json(await instructions.getBundle(existing));
+    const [bundle, instructionsAccess] = await Promise.all([
+      instructions.getBundle(existing),
+      resolveInstructionsAccess(req, existing),
+    ]);
+    res.json({ ...bundle, access: instructionsAccess });
   });
 
   router.patch("/agents/:id/instructions-bundle", validate(updateAgentInstructionsBundleSchema), async (req, res) => {

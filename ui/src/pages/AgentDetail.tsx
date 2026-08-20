@@ -81,6 +81,7 @@ import {
   HelpCircle,
   FolderOpen,
   AlertTriangle,
+  Lock,
 } from "lucide-react";
 import { Collapsible, CollapsibleTrigger, CollapsibleContent } from "@/components/ui/collapsible";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -98,6 +99,8 @@ import {
   isUuidLike,
   type Agent,
   type AgentDetail as AgentDetailRecord,
+  type AgentInstructionsAccess,
+  type PermissionEscalationContact,
   type BudgetPolicySummary,
   type HeartbeatRun,
   type HeartbeatRunEvent,
@@ -2247,6 +2250,12 @@ export function PromptsTab({
     };
   }, [bundle, currentEntryFile, currentMode, currentRootPath, selectedOrEntryFile]);
 
+  const instructionsAccess = bundle?.access ?? null;
+  // A server that predates the `access` block sends nothing here; stay editable
+  // in that case so we do not lock the editor on a missing field. The write
+  // routes still enforce the real gate.
+  const canEditInstructions = instructionsAccess ? instructionsAccess.canEdit : true;
+
   const currentContent = selectedFileExists ? (selectedFileDetail?.content ?? "") : "";
   const displayValue = draft ?? currentContent;
   const useMarkdownEditor = shouldUseMarkdownInstructionsEditor({
@@ -2264,7 +2273,10 @@ export function PromptsTab({
       ),
   );
   const fileDirty = draft !== null && draft !== currentContent;
-  const isDirty = bundleDirty || fileDirty;
+  // Without agents:configure there is nothing to save, so the page must never
+  // report itself dirty — that would arm the Save button and the unsaved-changes
+  // guard for a write the server is going to reject with a 403.
+  const isDirty = canEditInstructions && (bundleDirty || fileDirty);
   const isSaving = updateBundle.isPending || saveFile.isPending || deleteFile.isPending || awaitingRefresh;
 
   useEffect(() => { onSavingChange(isSaving); }, [onSavingChange, isSaving]);
@@ -2367,6 +2379,9 @@ export function PromptsTab({
           ))}
         </div>
       )}
+      {instructionsAccess && !instructionsAccess.canEdit && (
+        <InstructionsReadOnlyNotice access={instructionsAccess} />
+      )}
       <p className="text-xs text-muted-foreground">
         Saved instructions affect the next run. Active runs keep the instructions they started with, and instruction changes may start a fresh adapter session.
       </p>
@@ -2396,6 +2411,7 @@ export function PromptsTab({
                     type="button"
                     size="sm"
                     variant={currentMode === "managed" ? "default" : "outline"}
+                    disabled={!canEditInstructions}
                     onClick={() => {
                       if (currentMode === "external") {
                         externalBundleRef.current = {
@@ -2419,6 +2435,7 @@ export function PromptsTab({
                     type="button"
                     size="sm"
                     variant={currentMode === "external" ? "default" : "outline"}
+                    disabled={!canEditInstructions}
                     onClick={() => {
                       const externalBundle = externalBundleRef.current;
                       const nextEntryFile = externalBundle?.entryFile ?? currentEntryFile ?? "AGENTS.md";
@@ -2474,6 +2491,7 @@ export function PromptsTab({
                       }}
                       className="font-mono text-sm"
                       placeholder="/absolute/path/to/agent/prompts"
+                      readOnly={!canEditInstructions}
                     />
                     {currentRootPath && (
                       <CopyText text={currentRootPath} className="shrink-0">
@@ -2497,6 +2515,7 @@ export function PromptsTab({
                 </span>
                 <Input
                   value={currentEntryFile}
+                  readOnly={!canEditInstructions}
                   onChange={(event) => {
                     const nextEntryFile = event.target.value || "AGENTS.md";
                     const nextSelectedFile = selectedOrEntryFile === currentEntryFile
@@ -2541,7 +2560,7 @@ export function PromptsTab({
           <div className="flex items-center justify-between">
             <h4 className="text-sm font-medium">Files</h4>
             <div className="flex items-center gap-1">
-              {!showNewFileInput && (
+              {!showNewFileInput && canEditInstructions && (
                 <Button
                   type="button"
                   size="icon"
@@ -2704,7 +2723,7 @@ export function PromptsTab({
                   <Copy className="h-3.5 w-3.5" />
                 </CopyText>
               )}
-              {selectedFileExists && !selectedFileSummary?.deprecated && selectedOrEntryFile !== currentEntryFile && (
+              {canEditInstructions && selectedFileExists && !selectedFileSummary?.deprecated && selectedOrEntryFile !== currentEntryFile && (
                 <Button
                   type="button"
                   size="sm"
@@ -2733,6 +2752,7 @@ export function PromptsTab({
             <MarkdownEditor
               key={selectedOrEntryFile}
               value={displayValue}
+              readOnly={!canEditInstructions}
               onChange={(value) => setDraft(value ?? "")}
               placeholder="# Agent instructions"
               className="min-w-0 overflow-hidden"
@@ -2746,14 +2766,85 @@ export function PromptsTab({
           ) : (
             <textarea
               value={displayValue}
+              readOnly={!canEditInstructions}
               onChange={(event) => setDraft(event.target.value)}
-              className="min-h-(--sz-420px) w-full min-w-0 rounded-md border border-border bg-transparent px-3 py-2 font-mono text-sm outline-none"
+              className={cn(
+                "min-h-(--sz-420px) w-full min-w-0 rounded-md border border-border bg-transparent px-3 py-2 font-mono text-sm outline-none",
+                !canEditInstructions && "cursor-not-allowed text-muted-foreground",
+              )}
               placeholder="File contents"
             />
           )}
         </div>
       </div>
 
+    </div>
+  );
+}
+
+function formatEscalationContact(contact: PermissionEscalationContact) {
+  const label = contact.name ?? contact.email ?? contact.userId;
+  if (contact.email && contact.name) return `${contact.name} (${contact.email})`;
+  return label;
+}
+
+/**
+ * Shown in place of an editable instructions bundle when the signed-in user is
+ * missing `agents:configure`. The point is that nobody types out a full rewrite
+ * and only discovers the 403 when they hit Save — so it has to say what is
+ * missing and who can grant it.
+ */
+function InstructionsReadOnlyNotice({ access }: { access: AgentInstructionsAccess }) {
+  const owners = access.escalationContacts.filter((contact) => contact.isCompanyOwner);
+  const permissionManagers = access.escalationContacts.filter(
+    (contact) => !contact.isCompanyOwner && contact.canManagePermissions,
+  );
+
+  return (
+    <div
+      role="status"
+      data-testid="instructions-readonly-notice"
+      className="flex items-start gap-3 rounded-md border border-amber-300/35 bg-amber-300/10 px-3 py-2 text-sm text-amber-900 dark:text-amber-100"
+    >
+      <Lock className="mt-0.5 h-4 w-4 shrink-0" />
+      <div className="min-w-0 space-y-1">
+        <p className="font-medium">Read-only — you cannot edit these instructions</p>
+        <p className="text-amber-900/90 dark:text-amber-100/90">
+          {access.canSuggestChanges
+            ? `You can suggest instruction changes, but applying them needs an accepted change consent. Editing directly requires the ${access.requiredPermissionKey} permission in this company.`
+            : `Editing agent instructions requires the ${access.requiredPermissionKey} permission in this company, which your account does not have.`}
+        </p>
+        {access.escalationContacts.length > 0 ? (
+          <p className="text-amber-900/90 dark:text-amber-100/90">
+            Ask{" "}
+            {owners.length > 0 && (
+              <>
+                the company owner
+                {owners.length > 1 ? "s" : ""}{" "}
+                <span className="font-medium">{owners.map(formatEscalationContact).join(", ")}</span>
+              </>
+            )}
+            {owners.length > 0 && permissionManagers.length > 0 && ", or "}
+            {permissionManagers.length > 0 && (
+              <>
+                someone who can manage permissions —{" "}
+                <span className="font-medium">
+                  {permissionManagers.map(formatEscalationContact).join(", ")}
+                </span>
+              </>
+            )}
+            {" "}to grant you {access.requiredPermissionKey}.
+          </p>
+        ) : (
+          <p className="text-amber-900/90 dark:text-amber-100/90">
+            Ask a company owner or anyone holding <code>users:manage_permissions</code> to grant you{" "}
+            {access.requiredPermissionKey}.
+          </p>
+        )}
+        {access.deniedExplanation && (
+          <p className="text-xs text-amber-900/80 dark:text-amber-100/80">{access.deniedExplanation}</p>
+        )}
+      </div>
     </div>
   );
 }

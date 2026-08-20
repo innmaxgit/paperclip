@@ -40,6 +40,7 @@ const mockEnvironmentService = vi.hoisted(() => ({
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockSyncInstructionsBundleConfigFromFilePath = vi.hoisted(() => vi.fn());
 const mockFindServerAdapter = vi.hoisted(() => vi.fn());
+const mockListPermissionEscalationContacts = vi.hoisted(() => vi.fn());
 
 vi.mock("../services/index.js", () => ({
   agentService: () => mockAgentService,
@@ -72,7 +73,15 @@ vi.mock("../adapters/index.js", () => ({
   listAdapterModels: vi.fn(),
 }));
 
+vi.mock("../services/permission-escalation-contacts.js", () => ({
+  listPermissionEscalationContacts: mockListPermissionEscalationContacts,
+}));
+
 function registerModuleMocks() {
+  vi.doMock("../services/permission-escalation-contacts.js", () => ({
+    listPermissionEscalationContacts: mockListPermissionEscalationContacts,
+  }));
+
   vi.doMock("../services/index.js", () => ({
     agentService: () => mockAgentService,
     agentInstructionsService: () => mockAgentInstructionsService,
@@ -202,6 +211,7 @@ describe("agent instructions bundle routes", () => {
     mockBuiltInAgentService.ensureCompanyDefaultAgentGrants.mockResolvedValue(0);
     mockSyncInstructionsBundleConfigFromFilePath.mockImplementation((_agent, config) => config);
     mockFindServerAdapter.mockImplementation((_type: string) => ({ type: _type }));
+    mockListPermissionEscalationContacts.mockResolvedValue([]);
     mockAccessService.decide.mockResolvedValue({
       allowed: true,
       reason: "allow_explicit_grant",
@@ -283,6 +293,108 @@ describe("agent instructions bundle routes", () => {
       entryFile: "AGENTS.md",
     });
     expect(mockAgentInstructionsService.getBundle).toHaveBeenCalled();
+  });
+
+  it("reports canEdit on the bundle when the caller may update agent config", async () => {
+    const res = await requestApp(
+      await createApp(),
+      (baseUrl) => request(baseUrl)
+        .get("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle?companyId=company-1"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.access).toEqual({
+      canEdit: true,
+      canSuggestChanges: false,
+      requiredPermissionKey: "agents:configure",
+      deniedReason: null,
+      deniedExplanation: null,
+      escalationContacts: [],
+    });
+    // No point paying for the contact lookup when the caller can already edit.
+    expect(mockListPermissionEscalationContacts).not.toHaveBeenCalled();
+  });
+
+  it("reports the denial and who can grant it when the caller lacks agents:configure", async () => {
+    // Readable but not writable: exactly the CAR-23 shape where an admin has a
+    // membership but is missing the agents:configure grant row.
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+      if (input.action === "agent_config:update") {
+        return {
+          allowed: false,
+          reason: "deny_no_grant",
+          explanation: "Missing permission: agents:configure or agents:suggest-changes.",
+        };
+      }
+      return {
+        allowed: true,
+        reason: "allow_explicit_grant",
+        explanation: "Allowed by test grant",
+      };
+    });
+    mockListPermissionEscalationContacts.mockResolvedValue([
+      {
+        userId: "user-owner",
+        name: "Nina Owner",
+        email: "nina@innmax.com",
+        membershipRole: "owner",
+        isCompanyOwner: true,
+        canManagePermissions: true,
+      },
+    ]);
+
+    const res = await requestApp(
+      await createApp(),
+      (baseUrl) => request(baseUrl)
+        .get("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle?companyId=company-1"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.access).toMatchObject({
+      canEdit: false,
+      canSuggestChanges: false,
+      requiredPermissionKey: "agents:configure",
+      deniedReason: "deny_no_grant",
+      deniedExplanation: "Missing permission: agents:configure or agents:suggest-changes.",
+    });
+    expect(res.body.access.escalationContacts).toEqual([
+      expect.objectContaining({ userId: "user-owner", isCompanyOwner: true }),
+    ]);
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "agent_config:update",
+      scope: { requiresChangeGrant: true },
+    }));
+  });
+
+  it("flags canSuggestChanges when the denial is only a missing change consent", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => {
+      if (input.action === "agent_config:update") {
+        return {
+          allowed: false,
+          reason: "deny_missing_consent",
+          explanation:
+            "Permission agents:suggest-changes requires accepted change consent before applying this mutation.",
+        };
+      }
+      return {
+        allowed: true,
+        reason: "allow_explicit_grant",
+        explanation: "Allowed by test grant",
+      };
+    });
+
+    const res = await requestApp(
+      await createApp(),
+      (baseUrl) => request(baseUrl)
+        .get("/api/agents/11111111-1111-4111-8111-111111111111/instructions-bundle?companyId=company-1"),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.access).toMatchObject({
+      canEdit: false,
+      canSuggestChanges: true,
+      deniedReason: "deny_missing_consent",
+    });
   });
 
   it("denies non-privileged agents from reading peer instructions bundles", async () => {

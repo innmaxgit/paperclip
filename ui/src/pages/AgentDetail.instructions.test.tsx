@@ -4,7 +4,7 @@ import type { ComponentProps } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { Agent, AgentInstructionsBundle, AgentInstructionsFileDetail, AgentInstructionsFileSummary } from "@paperclipai/shared";
+import type { Agent, AgentInstructionsAccess, AgentInstructionsBundle, AgentInstructionsFileDetail, AgentInstructionsFileSummary } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PromptsTab } from "./AgentDetail";
 
@@ -53,17 +53,20 @@ vi.mock("../components/MarkdownEditor", () => ({
     placeholder,
     contentClassName,
     imageUploadHandler,
+    readOnly,
   }: {
     value: string;
     onChange: (value: string) => void;
     placeholder?: string;
     contentClassName?: string;
     imageUploadHandler?: (file: File) => Promise<string>;
+    readOnly?: boolean;
   }) => {
     markdownEditorRenderMock({
       value,
       contentClassName,
       hasImageUploadHandler: Boolean(imageUploadHandler),
+      readOnly: Boolean(readOnly),
     });
     return (
       <textarea
@@ -72,6 +75,7 @@ vi.mock("../components/MarkdownEditor", () => ({
         className={contentClassName}
         placeholder={placeholder}
         value={value}
+        readOnly={Boolean(readOnly)}
         onChange={(event) => onChange(event.target.value)}
       />
     );
@@ -384,6 +388,149 @@ describe("PromptsTab instruction editor", () => {
     await waitFor(() => {
       expect(container.querySelector('[data-testid="markdown-editor"]')).toBeNull();
       expect(container.querySelector<HTMLTextAreaElement>('textarea[placeholder="File contents"]')?.value).toBe("raw instructions");
+    });
+  });
+
+  describe("without agents:configure", () => {
+    const deniedAccess: AgentInstructionsAccess = {
+      canEdit: false,
+      canSuggestChanges: false,
+      requiredPermissionKey: "agents:configure",
+      deniedReason: "deny_no_grant",
+      deniedExplanation: "Missing permission: agents:configure or agents:suggest-changes.",
+      escalationContacts: [
+        {
+          userId: "user-owner",
+          name: "Nina Owner",
+          email: "nina@innmax.com",
+          membershipRole: "owner",
+          isCompanyOwner: true,
+          canManagePermissions: true,
+        },
+        {
+          userId: "user-manager",
+          name: "Pat Manager",
+          email: "pat@innmax.com",
+          membershipRole: "operator",
+          isCompanyOwner: false,
+          canManagePermissions: true,
+        },
+      ],
+    };
+
+    it("renders the markdown editor read-only and never arms a save action", async () => {
+      const summary = makeSummary("AGENTS.md", "AGENTS.md");
+      await renderPromptsTab(
+        makeBundle("AGENTS.md", [summary], { access: deniedAccess }),
+        { "AGENTS.md": makeDetail(summary, "# Current") },
+      );
+
+      const editor = await waitFor(() => {
+        const candidate = container.querySelector<HTMLTextAreaElement>('[data-testid="markdown-editor"]');
+        expect(candidate).not.toBeNull();
+        return candidate!;
+      });
+      expect(editor.readOnly).toBe(true);
+      expect(markdownEditorRenderMock).toHaveBeenLastCalledWith(
+        expect.objectContaining({ readOnly: true }),
+      );
+
+      // Even if a draft somehow lands in state, the tab must not expose Save —
+      // that is exactly the "type a full rewrite, then eat a 403" trap.
+      await act(async () => {
+        setNativeValue(editor, "# Rewritten");
+      });
+      await flushReact();
+      expect(saveAction).toBeNull();
+      expect(mockAgentsApi.saveInstructionsFile).not.toHaveBeenCalled();
+    });
+
+    it("marks the raw textarea read-only for non-markdown files", async () => {
+      const summary = makeSummary("settings.json", "settings.json", {
+        language: "json",
+        markdown: false,
+      });
+      await renderPromptsTab(
+        makeBundle("settings.json", [summary], { access: deniedAccess }),
+        { "settings.json": makeDetail(summary, "{}") },
+      );
+
+      await waitFor(() => {
+        const editor = container.querySelector<HTMLTextAreaElement>('textarea[placeholder="File contents"]');
+        expect(editor).not.toBeNull();
+        expect(editor!.readOnly).toBe(true);
+      });
+    });
+
+    it("explains the missing permission and names who can grant it", async () => {
+      const summary = makeSummary("AGENTS.md", "AGENTS.md");
+      await renderPromptsTab(
+        makeBundle("AGENTS.md", [summary], { access: deniedAccess }),
+        { "AGENTS.md": makeDetail(summary, "# Current") },
+      );
+
+      const notice = await waitFor(() => {
+        const candidate = container.querySelector<HTMLElement>('[data-testid="instructions-readonly-notice"]');
+        expect(candidate).not.toBeNull();
+        return candidate!;
+      });
+      const text = notice.textContent ?? "";
+      expect(text).toContain("Read-only");
+      expect(text).toContain("agents:configure");
+      expect(text).toContain("Nina Owner (nina@innmax.com)");
+      expect(text).toContain("Pat Manager (pat@innmax.com)");
+    });
+
+    it("hides the new-file control so read-only users cannot start files they cannot save", async () => {
+      const summary = makeSummary("AGENTS.md", "AGENTS.md");
+      await renderPromptsTab(
+        makeBundle("AGENTS.md", [summary], { access: deniedAccess }),
+        { "AGENTS.md": makeDetail(summary, "# Current") },
+      );
+
+      await waitFor(() => {
+        expect(container.querySelector('[data-testid="instructions-readonly-notice"]')).not.toBeNull();
+      });
+      expect(() => buttonByText(container, "+")).toThrow();
+    });
+
+    it("stays editable when the server omits the access block", async () => {
+      const summary = makeSummary("AGENTS.md", "AGENTS.md");
+      await renderPromptsTab(
+        makeBundle("AGENTS.md", [summary]),
+        { "AGENTS.md": makeDetail(summary, "# Current") },
+      );
+
+      const editor = await waitFor(() => {
+        const candidate = container.querySelector<HTMLTextAreaElement>('[data-testid="markdown-editor"]');
+        expect(candidate).not.toBeNull();
+        return candidate!;
+      });
+      expect(editor.readOnly).toBe(false);
+      expect(container.querySelector('[data-testid="instructions-readonly-notice"]')).toBeNull();
+    });
+
+    it("tells suggest-changes holders that applying needs an accepted change consent", async () => {
+      const summary = makeSummary("AGENTS.md", "AGENTS.md");
+      await renderPromptsTab(
+        makeBundle("AGENTS.md", [summary], {
+          access: {
+            ...deniedAccess,
+            canSuggestChanges: true,
+            deniedReason: "deny_missing_consent",
+            deniedExplanation:
+              "Permission agents:suggest-changes requires accepted change consent before applying this mutation.",
+          },
+        }),
+        { "AGENTS.md": makeDetail(summary, "# Current") },
+      );
+
+      const notice = await waitFor(() => {
+        const candidate = container.querySelector<HTMLElement>('[data-testid="instructions-readonly-notice"]');
+        expect(candidate).not.toBeNull();
+        return candidate!;
+      });
+      expect(notice.textContent).toContain("suggest instruction changes");
     });
   });
 });

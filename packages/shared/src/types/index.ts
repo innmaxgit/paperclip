@@ -247,6 +247,8 @@ export type {
   AgentInstructionsFileSummary,
   AgentInstructionsFileDetail,
   AgentInstructionsBundle,
+  AgentInstructionsAccess,
+  PermissionEscalationContact,
   AgentKeyCreated,
   AgentConfigRevision,
   AdapterEnvironmentCheckLevel,
