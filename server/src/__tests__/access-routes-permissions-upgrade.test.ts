@@ -86,7 +86,12 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-access-routes-permissions-upgrade-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+    // Pay the routes module's (multi-second) load cost once here instead of billing it to
+    // whichever test happens to run first and pushing it over its own timeout.
+    process.env.PAPERCLIP_LOG_DIR = "/tmp/paperclip-test-home/logs";
+    process.env.PAPERCLIP_IN_WORKTREE = "false";
+    await import("../routes/access.js");
+  }, 40_000);
 
   afterEach(async () => {
     await db.delete(activityLog);
@@ -164,4 +169,156 @@ describeEmbeddedPostgres("access routes permissions upgrade compatibility", () =
       grantedByUserId: owner.principalId,
     });
   });
+
+  async function createMember(
+    db: Db,
+    companyId: string,
+    membershipRole: string,
+    grantKeys: string[],
+  ) {
+    const member = await db
+      .insert(companyMemberships)
+      .values({
+        companyId,
+        principalType: "user",
+        principalId: `member-${randomUUID()}`,
+        status: "active",
+        membershipRole,
+      })
+      .returning()
+      .then((rows) => rows[0]!);
+    if (grantKeys.length > 0) {
+      await db.insert(principalPermissionGrants).values(
+        grantKeys.map((permissionKey) => ({
+          companyId,
+          principalType: "user" as const,
+          principalId: member.principalId,
+          permissionKey: permissionKey as any,
+          scope: null,
+          grantedByUserId: null,
+        })),
+      );
+    }
+    return member;
+  }
+
+  async function grantKeysFor(db: Db, companyId: string, principalId: string) {
+    const rows = await db
+      .select()
+      .from(principalPermissionGrants)
+      .where(
+        and(
+          eq(principalPermissionGrants.companyId, companyId),
+          eq(principalPermissionGrants.principalType, "user"),
+          eq(principalPermissionGrants.principalId, principalId),
+        ),
+      );
+    return rows.map((row) => row.permissionKey).sort();
+  }
+
+  const ADMIN_DEFAULT_KEYS = [
+    "agents:create",
+    "agents:configure",
+    "skills:create",
+    "environments:manage",
+    "users:invite",
+    "tasks:assign",
+    "joins:approve",
+  ];
+
+  it("adds the keys the new role introduces when a member is upgraded admin -> owner", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    // A manual extra grant that no role default set contains: it must survive the upgrade.
+    const member = await createMember(db, company.id, "admin", [
+      ...ADMIN_DEFAULT_KEYS,
+      "tasks:assign_scope",
+    ]);
+
+    const res = await request(await createApp(db, company.id, owner.principalId))
+      .patch(`/api/companies/${company.id}/members/${member.id}`)
+      .send({ membershipRole: "owner" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.membershipRole).toBe("owner");
+
+    const keys = await grantKeysFor(db, company.id, member.principalId);
+    // owner adds users:manage_permissions on top of the admin default set...
+    expect(keys).toContain("users:manage_permissions");
+    // ...every admin default key is still there (owner is a superset of admin)...
+    for (const key of ADMIN_DEFAULT_KEYS) expect(keys).toContain(key);
+    // ...and the manual grant is untouched.
+    expect(keys).toContain("tasks:assign_scope");
+    expect(keys).toHaveLength(ADMIN_DEFAULT_KEYS.length + 2);
+  }, 10_000);
+
+  // The HTTP route cannot reach an owner -> admin downgrade: getProtectedMemberReason
+  // rejects a target whose role ranks at or above the actor's, and the actor role tops
+  // out at "owner". So the downgrade recompute is exercised here at the seam the route
+  // calls, against the same database.
+  it("removes only old-role-exclusive default keys when a member is downgraded owner -> admin", async () => {
+    const { company } = await createCompanyWithOwner(db);
+    const member = await createMember(db, company.id, "owner", [
+      ...ADMIN_DEFAULT_KEYS,
+      "users:manage_permissions",
+      "tasks:assign_scope",
+    ]);
+
+    const { syncHumanRoleDefaultGrants } = await import(
+      "../services/principal-access-compatibility.js"
+    );
+    const result = await syncHumanRoleDefaultGrants(db, {
+      companyId: company.id,
+      principalId: member.principalId,
+      previousMembershipRole: "owner",
+      nextMembershipRole: "admin",
+      grantedByUserId: null,
+    });
+
+    // users:manage_permissions is the only key owner defaults to that admin does not.
+    expect(result.removedKeys).toEqual(["users:manage_permissions"]);
+    expect(result.addedKeys).toEqual([]);
+
+    const keys = await grantKeysFor(db, company.id, member.principalId);
+    expect(keys).not.toContain("users:manage_permissions");
+    // Keys shared by both default sets stay.
+    for (const key of ADMIN_DEFAULT_KEYS) expect(keys).toContain(key);
+    // The manual grant is in neither default set, so the downgrade must not reach it.
+    expect(keys).toContain("tasks:assign_scope");
+    expect(keys).toHaveLength(ADMIN_DEFAULT_KEYS.length + 1);
+  }, 10_000);
+
+  it("keeps manual extra grants across a downgrade that strips most role defaults", async () => {
+    const { company, owner } = await createCompanyWithOwner(db);
+    const member = await createMember(db, company.id, "admin", [
+      ...ADMIN_DEFAULT_KEYS,
+      "tasks:assign_scope",
+      "pipelines:write",
+    ]);
+
+    const res = await request(await createApp(db, company.id, owner.principalId))
+      .patch(`/api/companies/${company.id}/members/${member.id}`)
+      .send({ membershipRole: "operator" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.membershipRole).toBe("operator");
+
+    const keys = await grantKeysFor(db, company.id, member.principalId);
+    // operator defaults to tasks:assign only; every other admin default key is dropped.
+    expect(keys).toEqual(["pipelines:write", "tasks:assign", "tasks:assign_scope"].sort());
+
+    // The role change and its grant recomputation are recorded on one activity_log row.
+    const logs = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, company.id),
+          eq(activityLog.action, "company_member.updated"),
+        ),
+      );
+    expect(logs).toHaveLength(1);
+    expect((logs[0]!.details as any).roleGrantsRemoved).toEqual(
+      expect.arrayContaining(["agents:create", "agents:configure", "joins:approve"]),
+    );
+  }, 10_000);
 });

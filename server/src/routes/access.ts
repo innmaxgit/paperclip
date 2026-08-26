@@ -69,7 +69,8 @@ import {
   boardAuthService,
   deduplicateAgentName,
   logActivity,
-  notifyHireApproved
+  notifyHireApproved,
+  syncHumanRoleDefaultGrants
 } from "../services/index.js";
 import {
   grantsForHumanRole,
@@ -4514,7 +4515,7 @@ export function accessRoutes(
           }
         }
 
-        return tx
+        const updatedMember = await tx
           .update(companyMemberships)
           .set({
             membershipRole: nextMembershipRole,
@@ -4524,21 +4525,39 @@ export function accessRoutes(
           .where(eq(companyMemberships.id, existing.id))
           .returning()
           .then((rows) => rows[0] ?? existing);
+
+        // A role change moves the member's role-default grants with it, in the same
+        // transaction as the role write, so the two can never drift apart. Manual extra
+        // grants (keys outside the role default sets) are left untouched.
+        const grantSync =
+          existing.principalType === "user"
+            ? await syncHumanRoleDefaultGrants(tx as unknown as Db, {
+              companyId,
+              principalId: existing.principalId,
+              previousMembershipRole: existing.membershipRole,
+              nextMembershipRole: updatedMember.membershipRole,
+              grantedByUserId: req.actor.userId ?? null,
+            })
+            : null;
+
+        await logActivity(tx as unknown as Db, {
+          companyId,
+          actorType: "user",
+          actorId: req.actor.userId ?? "board",
+          action: "company_member.updated",
+          entityType: "company_membership",
+          entityId: memberId,
+          details: {
+            membershipRole: updatedMember.membershipRole,
+            status: updatedMember.status,
+            roleGrantsAdded: grantSync?.addedKeys ?? [],
+            roleGrantsRemoved: grantSync?.removedKeys ?? [],
+          },
+        });
+
+        return updatedMember;
       });
       if (!updated) throw notFound("Member not found");
-
-      await logActivity(db, {
-        companyId,
-        actorType: "user",
-        actorId: req.actor.userId ?? "board",
-        action: "company_member.updated",
-        entityType: "company_membership",
-        entityId: memberId,
-        details: {
-          membershipRole: updated.membershipRole,
-          status: updated.status,
-        },
-      });
 
       const member = (await loadCompanyMemberRecords(db, companyId)).find(
         (entry) => entry.id === memberId,
