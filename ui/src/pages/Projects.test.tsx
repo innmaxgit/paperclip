@@ -19,9 +19,11 @@ const mockResourceMembershipsApi = vi.hoisted(() => ({
 }));
 
 const mockOpenNewProject = vi.hoisted(() => vi.fn());
+const mockNavigate = vi.hoisted(() => vi.fn());
 const mockSetBreadcrumbs = vi.hoisted(() => vi.fn());
 
 vi.mock("@/lib/router", () => ({
+  useNavigate: () => mockNavigate,
   Link: ({ children, to, ...props }: { children?: ReactNode; to: string }) => (
     <a href={to} {...props}>{children}</a>
   ),
@@ -233,10 +235,10 @@ describe("Projects", () => {
   it("reserves description line height for projects without descriptions", async () => {
     await renderProjects();
 
-    const bravoLink = Array.from(container.querySelectorAll<HTMLAnchorElement>("a")).find((link) =>
-      link.textContent?.includes("Bravo"),
+    const bravoRow = Array.from(container.querySelectorAll<HTMLElement>(".group")).find((row) =>
+      row.textContent?.includes("Bravo"),
     );
-    const hiddenDescriptionLine = bravoLink?.querySelector("p[aria-hidden='true']");
+    const hiddenDescriptionLine = bravoRow?.querySelector("p[aria-hidden='true']");
 
     expect(hiddenDescriptionLine).not.toBeNull();
     expect(hiddenDescriptionLine?.className).toContain("min-h-4");
