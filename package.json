@@ -126,6 +126,7 @@
       "assistant-cloud": "0.1.41",
       "assistant-stream": "0.3.39",
       "vite": "8.2.2",
+      "lucide-react": "1.38.0",
       "@pierre/diffs": "1.3.6",
       "@microsoft/teams.api": "2.0.16",
       "@microsoft/teams.apps": "2.0.16",
