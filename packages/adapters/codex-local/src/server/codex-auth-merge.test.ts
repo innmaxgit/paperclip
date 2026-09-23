@@ -47,8 +47,9 @@ describe("codex home auth merge on sandbox asset extract", () => {
   }
 
   async function runCodexHomeAssetExtract(input: {
-    sandboxAuth: string;
-    hostAuth: string;
+    sandboxAuth?: string;
+    hostAuth?: string;
+    imageAuth?: string;
   }): Promise<{
     commandText: string;
     writtenPaths: string[];
@@ -67,9 +68,19 @@ describe("codex home auth merge on sandbox asset extract", () => {
     await mkdir(localHomeDir, { recursive: true });
     await mkdir(remoteHomeDir, { recursive: true });
     await writeFile(path.join(localWorkspaceDir, "README.md"), "workspace\n", "utf8");
-    await writeFile(path.join(localHomeDir, "auth.json"), input.hostAuth, { mode: 0o600 });
+    if (input.hostAuth !== undefined) {
+      await writeFile(path.join(localHomeDir, "auth.json"), input.hostAuth, { mode: 0o600 });
+    }
     await writeFile(path.join(localHomeDir, "config.toml"), "model = \"gpt\"\n", "utf8");
-    await writeFile(path.join(remoteHomeDir, "auth.json"), input.sandboxAuth, { mode: 0o600 });
+    if (input.sandboxAuth !== undefined) {
+      await writeFile(path.join(remoteHomeDir, "auth.json"), input.sandboxAuth, { mode: 0o600 });
+    }
+    // A fake in-sandbox $HOME whose ~/.codex may carry the image's own login.
+    const imageHomeDir = path.join(rootDir, "image-home");
+    await mkdir(path.join(imageHomeDir, ".codex"), { recursive: true });
+    if (input.imageAuth !== undefined) {
+      await writeFile(path.join(imageHomeDir, ".codex", "auth.json"), input.imageAuth, { mode: 0o600 });
+    }
 
     const commands: string[] = [];
     const outputs: string[] = [];
@@ -90,7 +101,10 @@ describe("codex home auth merge on sandbox asset extract", () => {
       },
       run: async (command) => {
         commands.push(command);
-        const result = await execFile("sh", ["-c", command], { maxBuffer: 32 * 1024 * 1024 });
+        const result = await execFile("sh", ["-c", command], {
+          maxBuffer: 32 * 1024 * 1024,
+          env: { ...process.env, HOME: imageHomeDir },
+        });
         outputs.push(result.stdout, result.stderr);
       },
     };
@@ -375,6 +389,64 @@ describe("codex home auth merge on sandbox asset extract", () => {
     }
   });
 
+  it("falls back to the sandbox image's own login when neither host nor prior asset has auth", async () => {
+    const imageAuth = subscriptionAuth({
+      accountId: "acct-image",
+      lastRefresh: "2026-07-01T00:00:00Z",
+      marker: "image",
+    });
+    const result = await runCodexHomeAssetExtract({
+      imageAuth,
+    });
+
+    expect(result.finalAuth).toBe(imageAuth);
+    expect(result.finalMode).toBe(0o600);
+  });
+
+  it("prefers shipped host auth over the image's own login", async () => {
+    const hostAuth = subscriptionAuth({
+      accountId: "acct-host",
+      lastRefresh: "2026-07-02T00:00:00Z",
+      marker: "host",
+    });
+    const imageAuth = subscriptionAuth({
+      accountId: "acct-image",
+      lastRefresh: "2026-07-03T00:00:00Z",
+      marker: "image",
+    });
+    const result = await runCodexHomeAssetExtract({
+      hostAuth,
+      imageAuth,
+    });
+
+    expect(result.finalAuth).toBe(hostAuth);
+  });
+
+  it("prefers a preserved newer prior-lease credential over the image's own login", async () => {
+    const hostAuth = subscriptionAuth({
+      accountId: "acct-1",
+      lastRefresh: "2026-07-01T00:00:00Z",
+      marker: "host",
+    });
+    const sandboxAuth = subscriptionAuth({
+      accountId: "acct-1",
+      lastRefresh: "2026-07-05T00:00:00Z",
+      marker: "prior-lease",
+    });
+    const imageAuth = subscriptionAuth({
+      accountId: "acct-image",
+      lastRefresh: "2026-07-06T00:00:00Z",
+      marker: "image",
+    });
+    const result = await runCodexHomeAssetExtract({
+      hostAuth,
+      sandboxAuth,
+      imageAuth,
+    });
+
+    expect(result.finalAuth).toBe(sandboxAuth);
+  });
+
   it("routes the Codex home asset through a single native syncIn operation whose post-command is the auth-merge (#4, C5/C6)", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-native-route-"));
     cleanupDirs.push(rootDir);
@@ -524,6 +596,7 @@ describe("codex-auth-merge-decision predicate (source/destination)", () => {
 
   const KEEP_DESTINATION = 20;
   const USE_SOURCE = 10;
+  const IMPLAUSIBLE_LAST_REFRESH = 22;
 
   function subscriptionAuth(input: {
     accountId: string;
@@ -665,6 +738,18 @@ describe("codex-auth-merge-decision predicate (source/destination)", () => {
       destinationAuth: "{not valid json",
       expected: KEEP_DESTINATION,
     },
+    {
+      // 400 days ahead is comfortably beyond the 5-minute skew allowance and
+      // any subprocess-spawn scheduling delay, so this integration-level
+      // check never depends on millisecond timing.
+      name: "source last_refresh implausibly far in the future → keep destination",
+      sourceAuth: subscriptionAuth({
+        accountId: "acct",
+        lastRefresh: new Date(Date.now() + 400 * 24 * 60 * 60 * 1000).toISOString(),
+      }),
+      destinationAuth: subscriptionAuth({ accountId: "acct", lastRefresh: OLDER }),
+      expected: IMPLAUSIBLE_LAST_REFRESH,
+    },
   ];
 
   for (const entry of cases) {
@@ -687,6 +772,19 @@ describe("codex-auth-merge-decision predicate (source/destination)", () => {
       destinationAuth: subscriptionAuth({ accountId: "acct", lastRefresh: OLDER }),
     });
     expect(result.code).toBe(USE_SOURCE);
+    expect(result.output).not.toContain("SENTINEL");
+  });
+
+  it("never emits source token bytes for an implausibly-future last_refresh", async () => {
+    const result = await runDecision({
+      sourceAuth: subscriptionAuth({
+        accountId: "acct",
+        lastRefresh: new Date(Date.now() + 400 * 24 * 60 * 60 * 1000).toISOString(),
+        marker: "SECRET-SENTINEL",
+      }),
+      destinationAuth: subscriptionAuth({ accountId: "acct", lastRefresh: OLDER }),
+    });
+    expect(result.code).toBe(IMPLAUSIBLE_LAST_REFRESH);
     expect(result.output).not.toContain("SENTINEL");
   });
 });
