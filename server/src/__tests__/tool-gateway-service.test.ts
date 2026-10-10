@@ -15,6 +15,7 @@ import {
   issueComments,
   connectionGrants,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueApprovals,
   issues,
@@ -192,6 +193,8 @@ describeEmbeddedPostgres("tool gateway service", () => {
     await db.delete(toolApplications);
     await db.delete(companySecrets);
     await db.delete(toolPolicies);
+    // A stateful remote MCP call records its session lifecycle on the run log.
+    await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
     await db.delete(projects);

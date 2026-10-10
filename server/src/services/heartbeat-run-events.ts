@@ -1,7 +1,11 @@
-import { and, asc, eq, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRunEvents, heartbeatRuns } from "@paperclipai/db";
 import { nativeSha256 } from "./native-runtime/canonical.js";
+import type {
+  McpSessionLifecyclePort,
+  McpSessionLifecycleRecord,
+} from "./mcp-http.js";
 
 export interface AppendHeartbeatRunEventInput {
   companyId: string;
@@ -174,6 +178,75 @@ export async function appendHeartbeatRunEvent(
           )
         : 0,
     };
+  });
+}
+
+/** Run statuses during which a run may still execute tool calls. */
+const ACTIVE_RUN_STATUSES = new Set(["queued", "running", "scheduled_retry"]);
+
+/** The run-log event type carrying persistent MCP session transitions. */
+export const MCP_SESSION_LIFECYCLE_EVENT_TYPE = "tool_mcp_session";
+
+/**
+ * Durable lifecycle log for persistent MCP sessions, on the existing run log.
+ *
+ * The run row lock that serializes event-sequence allocation also serializes
+ * this read-then-append, so a scope's latest state and the transition derived
+ * from it cannot be interleaved with another writer. Only the caller's
+ * irreversible digests, owner identity, state/reason, and expiry bounds are
+ * stored — never the upstream session id, a token, or tool content.
+ */
+export async function transitionMcpSessionLifecycle(
+  db: Db,
+  input: Parameters<McpSessionLifecyclePort["transition"]>[0],
+): Promise<void> {
+  await db.transaction(async (tx) => {
+    const run = await tx
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, input.runId))
+      .for("update")
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (
+      !run ||
+      run.companyId !== input.companyId ||
+      run.agentId !== input.agentId
+    ) {
+      throw new Error("heartbeat_run_event_binding_mismatch");
+    }
+    const [latestRow] = await tx
+      .select()
+      .from(heartbeatRunEvents)
+      .where(and(
+        eq(heartbeatRunEvents.companyId, input.companyId),
+        eq(heartbeatRunEvents.runId, input.runId),
+        eq(heartbeatRunEvents.eventType, MCP_SESSION_LIFECYCLE_EVENT_TYPE),
+        sql`${heartbeatRunEvents.payload}->>'scopeHmac' = ${input.scopeHmac}`,
+      ))
+      .orderBy(desc(heartbeatRunEvents.seq))
+      .limit(1);
+    const decision = input.decide({
+      latest:
+        (latestRow?.payload as unknown as McpSessionLifecycleRecord | undefined) ??
+        null,
+      runActive: ACTIVE_RUN_STATUSES.has(run.status),
+    });
+    if (decision.kind === "reuse") return;
+    const seq = await allocateHeartbeatRunEventSeq(
+      tx as unknown as Db,
+      input.runId,
+    );
+    await tx.insert(heartbeatRunEvents).values({
+      companyId: input.companyId,
+      runId: input.runId,
+      agentId: input.agentId,
+      seq,
+      eventType: MCP_SESSION_LIFECYCLE_EVENT_TYPE,
+      level: "debug",
+      message: decision.message ?? null,
+      payload: { ...decision.record },
+    });
   });
 }
 

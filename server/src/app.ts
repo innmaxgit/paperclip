@@ -1311,6 +1311,10 @@ export async function createApp(
       hostServiceCleanup.teardown();
       await emailChannels.shutdown();
       await chatChannels.shutdown();
+      // Stateful MCP sessions outlive a single call, so tear them down here:
+      // the durable run log then records the loss instead of leaving a record
+      // that still looks live to the next process.
+      await toolGateway.shutdownPersistentMcpSessions();
       // Cancel every live setup-token login session and AWAIT the cancellation,
       // so each direct child stops and the server releases each lease before the
       // caller stops the database and the provider. A lease release that

@@ -86,10 +86,17 @@ import type {
 import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { secretService } from "./secrets.js";
 import {
-  initializeMcpHttpSession,
+  createPersistentMcpSessionRegistry,
   mcpHttpRequestHeaders,
+  mcpHttpSessionHeaders,
+  McpSessionLostError,
+  MCP_SESSION_LOST_REASON_CODE,
+  openMcpHttpSession,
   parseMcpHttpResponseBody,
+  type McpHttpSessionIdentity,
+  type McpPersistentSessionRegistryOptions,
 } from "./mcp-http.js";
+import { transitionMcpSessionLifecycle } from "./heartbeat-run-events.js";
 import {
   projectedConnectionHeaders,
   projectedConnectionToolArguments,
@@ -1013,6 +1020,11 @@ export function createToolGatewayService(
     onToolActionSettled?: (actionRequestId: string) => Promise<unknown>;
     /** Test seam for deterministic remote MCP protocol fixtures. */
     remoteHttpRequest?: (url: string, init: RequestInit) => Promise<Response>;
+    /** Lifecycle bounds and owner identity for persistent stateful MCP sessions. */
+    persistentMcpSessions?: Omit<
+      McpPersistentSessionRegistryOptions,
+      "lifecycle" | "now"
+    >;
     /** Test seam for Composio session creation without vendor traffic. */
     composioClientFactory?: (apiKey: string) => ComposioClient;
     /** Test seam for refreshing personal Gmail grants. */
@@ -1054,6 +1066,22 @@ export function createToolGatewayService(
     ...options.runtimeSupervisor,
   });
   const pluginToolDispatcher = options.pluginToolDispatcher;
+  // One persistent transport per fully re-validated scope inside a single
+  // server-authenticated run. Stateful MCP servers keep their state on the
+  // Streamable HTTP session, so re-initializing per call discarded it.
+  const persistentMcpSessions = createPersistentMcpSessionRegistry({
+    ...options.persistentMcpSessions,
+    now: options.now,
+    lifecycle: {
+      transition: (input) => transitionMcpSessionLifecycle(db, input),
+    },
+    onLifecycleWriteFailure: (error) => {
+      logger.warn(
+        { err: error },
+        "Failed to record an MCP session lifecycle transition",
+      );
+    },
+  });
   const interactions = issueThreadInteractionService(db);
   const policyService = toolAccessPolicyService(db);
   const secrets = secretService(db);
@@ -5685,6 +5713,62 @@ export function createToolGatewayService(
     );
   }
 
+  /**
+   * Upstream tools that end the session's state. After one of these the
+   * persistent session is torn down instead of being handed to the next call.
+   */
+  const SESSION_CLOSING_TOOL_NAMES = new Set(["browser_close", "close"]);
+
+  function closesMcpSession(upstreamToolName: string): boolean {
+    return SESSION_CLOSING_TOOL_NAMES.has(upstreamToolName.toLowerCase());
+  }
+
+  /**
+   * Irreversible digest of the resolved credential headers, so a token or
+   * secret rotation changes the session fingerprint without the value itself
+   * ever leaving this process.
+   */
+  function credentialHeaderDigest(
+    credentialHeaders: Record<string, string>,
+  ): string {
+    return createHash("sha256")
+      .update(
+        stableSerialize(
+          Object.fromEntries(
+            Object.entries(credentialHeaders).map(([name, value]) => [
+              name.toLowerCase(),
+              value,
+            ]),
+          ),
+        ),
+      )
+      .digest("hex");
+  }
+
+  /**
+   * Digest of the configuration that decides how we talk to a connection.
+   *
+   * Deliberately content-based rather than `updatedAt`: recording connection
+   * health rewrites that row on every call, which would otherwise look like a
+   * configuration change and throw away a healthy session.
+   */
+  function connectionConfigurationDigest(
+    connection: typeof toolConnections.$inferSelect,
+  ): string {
+    return createHash("sha256")
+      .update(
+        stableSerialize({
+          config: connection.config ?? null,
+          transportConfig: connection.transportConfig ?? null,
+          credentialRefs: connection.credentialRefs ?? null,
+          credentialPolicy: connection.credentialPolicy,
+          credentialSource: connection.credentialSource,
+          authKind: connection.authKind,
+        }),
+      )
+      .digest("hex");
+  }
+
   function normalizeMcpContent(content: unknown): string {
     if (!Array.isArray(content)) throw malformedRemoteMcpResponse();
     return content
@@ -5802,9 +5886,8 @@ export function createToolGatewayService(
               // letting the tighter default cut a legitimately slow tool short.
               responseTimeoutMs: ms,
             });
-      let requestHeaders = headers;
-      if (connection.config.mcpSessionRequired === true) {
-        requestHeaders = await initializeMcpHttpSession({
+      const openMcpSession = () =>
+        openMcpHttpSession({
           send: (init) =>
             dispatchRemote(endpoint, {
               ...init,
@@ -5814,270 +5897,407 @@ export function createToolGatewayService(
           headers,
           requestId,
         });
-      }
-      // The guard runs inside this call and the connection is pinned to the
-      // address it approved, so an operator-supplied hostname cannot be rebound
-      // onto a loopback or metadata address between validation and dispatch
-      // (PAP-17098).
-      const requestInit: RequestInit = {
-        method: "POST",
-        redirect: "manual",
-        // MCP Streamable HTTP requires the Accept header advertising both a JSON
-        // body and an SSE stream; spec-compliant servers 406 without it.
-        headers: mcpHttpRequestHeaders(requestHeaders),
-        signal: controller.signal,
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: requestId,
-          method: "tools/call",
-          params: {
-            name: entry.toolName,
-            arguments: parameters,
-          },
-        }),
-      };
-      let response = await dispatchRemote(endpoint, requestInit);
-      if (response.status === 401 && composioChild) {
-        composioSession = await composioSessions.ensureSession(connection.id, {
-          tools: [entry.toolName],
-          scopeRevision: composioScopeRevision,
-          force: true,
-        });
-        endpoint = composioSession.url;
-        credentialHeaders = composioSession.headers;
-        builtHeaders = buildRemoteHeaders({
-          session,
-          connection,
-          credentialHeaders,
-          callerHeaders,
-        });
-        headers = builtHeaders.headers;
-        headerSummary = builtHeaders.summary;
-        const retryInit = {
-          ...requestInit,
-          headers: mcpHttpRequestHeaders(headers),
+      // One dispatch of this tool call against an already negotiated session
+      // (or no session at all for a stateless server). Credentials are the
+      // ones resolved for this call, so a mid-call refresh still applies.
+      const dispatchToolCall = async (
+        sessionHeaders: Record<string, string>,
+      ) => {
+        // The guard runs inside this call and the connection is pinned to the
+        // address it approved, so an operator-supplied hostname cannot be rebound
+        // onto a loopback or metadata address between validation and dispatch
+        // (PAP-17098).
+        const requestInit: RequestInit = {
+          method: "POST",
+          redirect: "manual",
+          // MCP Streamable HTTP requires the Accept header advertising both a JSON
+          // body and an SSE stream; spec-compliant servers 406 without it.
+          headers: mcpHttpRequestHeaders({ ...headers, ...sessionHeaders }),
+          signal: controller.signal,
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: requestId,
+            method: "tools/call",
+            params: {
+              name: entry.toolName,
+              arguments: parameters,
+            },
+          }),
         };
-        response = await dispatchRemote(endpoint, retryInit);
-      }
-      const oauth = asRecord(asRecord(connection.config)?.oauth);
-      if (
-        response.status === 401 &&
-        connection.authKind === "oauth" &&
-        connection.credentialSource === "paperclip_vault" &&
-        isPaperclipCloudConnectorStrategy(oauth?.strategy)
-      ) {
-        credentialHeaders = {
-          ...projectedConnectionHeaders(connection),
-          ...(await resolveCredentialHeaders(session, connection, grant, {
-            forceRefresh: true,
-          })),
-        };
-        builtHeaders = buildRemoteHeaders({
-          session,
-          connection,
-          credentialHeaders,
-          callerHeaders,
-        });
-        headers = builtHeaders.headers;
-        headerSummary = builtHeaders.summary;
-        response = await dispatchRemote(endpoint, {
-          ...requestInit,
-          headers: mcpHttpRequestHeaders(headers),
-        });
-        if (response.status === 401) {
-          await db
-            .update(connectionGrants)
-            .set({
-              status: "needs_reauthorization",
-              updatedAt: new Date(options.now?.() ?? Date.now()),
-            })
-            .where(
-              and(
-                eq(connectionGrants.id, grant.id),
-                eq(connectionGrants.companyId, connection.companyId),
-              ),
-            );
+        let response = await dispatchRemote(endpoint, requestInit);
+        if (response.status === 401 && composioChild) {
+          composioSession = await composioSessions.ensureSession(connection.id, {
+            tools: [entry.toolName],
+            scopeRevision: composioScopeRevision,
+            force: true,
+          });
+          endpoint = composioSession.url;
+          credentialHeaders = composioSession.headers;
+          builtHeaders = buildRemoteHeaders({
+            session,
+            connection,
+            credentialHeaders,
+            callerHeaders,
+          });
+          headers = builtHeaders.headers;
+          headerSummary = builtHeaders.summary;
+          const retryInit = {
+            ...requestInit,
+            headers: mcpHttpRequestHeaders({ ...headers, ...sessionHeaders }),
+          };
+          response = await dispatchRemote(endpoint, retryInit);
         }
-      }
-      if (
-        response.status === 401 &&
-        connection.authKind === "oauth" &&
-        connection.credentialSource === "paperclip_vault" &&
-        !isPaperclipCloudConnectorStrategy(oauth?.strategy) &&
-        options.oauthGrantRefresher
-      ) {
-        credentialHeaders = {
-          ...projectedConnectionHeaders(connection),
-          ...(await resolveCredentialHeaders(session, connection, grant, {
-            forceRefresh: true,
-          })),
+        const oauth = asRecord(asRecord(connection.config)?.oauth);
+        if (
+          response.status === 401 &&
+          connection.authKind === "oauth" &&
+          connection.credentialSource === "paperclip_vault" &&
+          isPaperclipCloudConnectorStrategy(oauth?.strategy)
+        ) {
+          credentialHeaders = {
+            ...projectedConnectionHeaders(connection),
+            ...(await resolveCredentialHeaders(session, connection, grant, {
+              forceRefresh: true,
+            })),
+          };
+          builtHeaders = buildRemoteHeaders({
+            session,
+            connection,
+            credentialHeaders,
+            callerHeaders,
+          });
+          headers = builtHeaders.headers;
+          headerSummary = builtHeaders.summary;
+          response = await dispatchRemote(endpoint, {
+            ...requestInit,
+            headers: mcpHttpRequestHeaders({ ...headers, ...sessionHeaders }),
+          });
+          if (response.status === 401) {
+            await db
+              .update(connectionGrants)
+              .set({
+                status: "needs_reauthorization",
+                updatedAt: new Date(options.now?.() ?? Date.now()),
+              })
+              .where(
+                and(
+                  eq(connectionGrants.id, grant.id),
+                  eq(connectionGrants.companyId, connection.companyId),
+                ),
+              );
+          }
+        }
+        if (
+          response.status === 401 &&
+          connection.authKind === "oauth" &&
+          connection.credentialSource === "paperclip_vault" &&
+          !isPaperclipCloudConnectorStrategy(oauth?.strategy) &&
+          options.oauthGrantRefresher
+        ) {
+          credentialHeaders = {
+            ...projectedConnectionHeaders(connection),
+            ...(await resolveCredentialHeaders(session, connection, grant, {
+              forceRefresh: true,
+            })),
+          };
+          builtHeaders = buildRemoteHeaders({
+            session,
+            connection,
+            credentialHeaders,
+            callerHeaders,
+          });
+          headers = builtHeaders.headers;
+          headerSummary = builtHeaders.summary;
+          response = await dispatchRemote(endpoint, {
+            ...requestInit,
+            headers: mcpHttpRequestHeaders({ ...headers, ...sessionHeaders }),
+          });
+        }
+        if (
+          response.status === 401 &&
+          connection.credentialSource === "vercel_connect"
+        ) {
+          if (!connection.externalCredential || !vercelConnect) {
+            throw new ToolGatewayHttpError(
+              503,
+              "Vercel Connect is not configured",
+              "vercel_connect_unavailable",
+              {
+                connectionId: connection.id,
+              },
+            );
+          }
+          const tokenRequest = vercelTokenRequest({
+            credential: connection.externalCredential,
+            grant,
+            connectionId: connection.id,
+            companyId: connection.companyId,
+          });
+          vercelConnect.evict(tokenRequest);
+          credentialHeaders = {
+            ...projectedConnectionHeaders(connection),
+            ...(await resolveCredentialHeaders(session, connection, grant, {
+              forceRefresh: true,
+            })),
+          };
+          builtHeaders = buildRemoteHeaders({
+            session,
+            connection,
+            credentialHeaders,
+            callerHeaders,
+          });
+          headers = builtHeaders.headers;
+          headerSummary = builtHeaders.summary;
+          response = await dispatchRemote(endpoint, {
+            ...requestInit,
+            headers: mcpHttpRequestHeaders({ ...headers, ...sessionHeaders }),
+          });
+        }
+        return response;
+      };
+      // Everything from reading the body onwards is independent of how the
+      // session was obtained.
+      const completeToolCall = async (
+        response: Response,
+      ): Promise<RemoteHttpExecutionResult> => {
+        const body = await readBoundedRemoteResponse(response);
+        execution.response = {
+          httpStatus: response.status,
+          contentType: response.headers.get("content-type"),
+          bodySizeBytes: Buffer.byteLength(body, "utf8"),
+          upstreamRequestId:
+            response.headers.get("x-request-id") ??
+            response.headers.get("x-zapier-request-id") ??
+            response.headers.get("traceparent"),
         };
-        builtHeaders = buildRemoteHeaders({
-          session,
-          connection,
-          credentialHeaders,
-          callerHeaders,
-        });
-        headers = builtHeaders.headers;
-        headerSummary = builtHeaders.summary;
-        response = await dispatchRemote(endpoint, {
-          ...requestInit,
-          headers: mcpHttpRequestHeaders(headers),
-        });
-      }
-      if (
-        response.status === 401 &&
-        connection.credentialSource === "vercel_connect"
-      ) {
-        if (!connection.externalCredential || !vercelConnect) {
+        if (!response.ok) {
+          await markRemoteConnectionHealth(
+            connection,
+            "error",
+            "Remote MCP server returned an HTTP error.",
+          );
           throw new ToolGatewayHttpError(
-            503,
-            "Vercel Connect is not configured",
-            "vercel_connect_unavailable",
+            502,
+            "Remote MCP server returned an HTTP error",
+            "mcp_remote_status",
             {
+              status: response.status,
               connectionId: connection.id,
+              catalogEntryId: entry.id,
+              execution,
             },
           );
         }
-        const tokenRequest = vercelTokenRequest({
-          credential: connection.externalCredential,
-          grant,
-          connectionId: connection.id,
-          companyId: connection.companyId,
-        });
-        vercelConnect.evict(tokenRequest);
-        credentialHeaders = {
-          ...projectedConnectionHeaders(connection),
-          ...(await resolveCredentialHeaders(session, connection, grant, {
-            forceRefresh: true,
-          })),
-        };
-        builtHeaders = buildRemoteHeaders({
-          session,
+        let payload: unknown;
+        try {
+          payload = parseMcpHttpResponseBody(
+            body,
+            response.headers.get("content-type"),
+          );
+        } catch {
+          await markRemoteConnectionHealth(
+            connection,
+            "error",
+            "Remote MCP server returned invalid JSON.",
+          );
+          throw new ToolGatewayHttpError(
+            502,
+            "Remote MCP server returned invalid JSON",
+            "mcp_remote_invalid_json",
+            {
+              connectionId: connection.id,
+              catalogEntryId: entry.id,
+              execution,
+            },
+          );
+        }
+        const payloadRecord = asRecord(payload);
+        if (!payloadRecord) throw malformedRemoteMcpResponse();
+        const topLevelElicitation = extractMcpElicitationRequest(payloadRecord);
+        if (topLevelElicitation) {
+          await requestElicitationForRecordedToolCall({
+            session,
+            tool,
+            invocationId,
+            request: topLevelElicitation,
+          });
+        }
+        if (payloadRecord.error !== undefined) {
+          const errorRecord = asRecord(payloadRecord.error);
+          await markRemoteConnectionHealth(
+            connection,
+            "error",
+            "Remote MCP server returned a JSON-RPC error.",
+          );
+          throw new ToolGatewayHttpError(
+            502,
+            "Remote MCP server returned an error",
+            "remote_mcp_error",
+            {
+              code:
+                typeof errorRecord?.code === "number" ? errorRecord.code : null,
+              connectionId: connection.id,
+              catalogEntryId: entry.id,
+              execution,
+            },
+          );
+        }
+        if (!Object.prototype.hasOwnProperty.call(payloadRecord, "result")) {
+          throw malformedRemoteMcpResponse();
+        }
+        const resultElicitation = extractMcpElicitationRequest(
+          payloadRecord.result,
+        );
+        if (resultElicitation) {
+          await requestElicitationForRecordedToolCall({
+            session,
+            tool,
+            invocationId,
+            request: resultElicitation,
+          });
+        }
+        const sourceTemplateKey =
+          typeof connection.config.sourceTemplateKey === "string"
+            ? connection.config.sourceTemplateKey
+            : null;
+        const result = normalizeMcpToolResult(
+          payloadRecord.result,
+          "mcp_http",
+          false,
+          sourceTemplateKey,
+        );
+        await markRemoteConnectionHealth(
           connection,
-          credentialHeaders,
-          callerHeaders,
-        });
-        headers = builtHeaders.headers;
-        headerSummary = builtHeaders.summary;
-        response = await dispatchRemote(endpoint, {
-          ...requestInit,
-          headers: mcpHttpRequestHeaders(headers),
-        });
-      }
-      const body = await readBoundedRemoteResponse(response);
-      execution.response = {
-        httpStatus: response.status,
-        contentType: response.headers.get("content-type"),
-        bodySizeBytes: Buffer.byteLength(body, "utf8"),
-        upstreamRequestId:
-          response.headers.get("x-request-id") ??
-          response.headers.get("x-zapier-request-id") ??
-          response.headers.get("traceparent"),
+          "ok",
+          "Remote MCP server responded to tools/call.",
+        );
+        return { result, headerSummary, execution };
       };
-      if (!response.ok) {
-        await markRemoteConnectionHealth(
-          connection,
-          "error",
-          "Remote MCP server returned an HTTP error.",
-        );
-        throw new ToolGatewayHttpError(
-          502,
-          "Remote MCP server returned an HTTP error",
-          "mcp_remote_status",
-          {
-            status: response.status,
-            connectionId: connection.id,
-            catalogEntryId: entry.id,
-            execution,
-          },
-        );
-      }
-      let payload: unknown;
-      try {
-        payload = parseMcpHttpResponseBody(
-          body,
-          response.headers.get("content-type"),
-        );
-      } catch {
-        await markRemoteConnectionHealth(
-          connection,
-          "error",
-          "Remote MCP server returned invalid JSON.",
-        );
-        throw new ToolGatewayHttpError(
-          502,
-          "Remote MCP server returned invalid JSON",
-          "mcp_remote_invalid_json",
-          {
-            connectionId: connection.id,
-            catalogEntryId: entry.id,
-            execution,
-          },
-        );
-      }
-      const payloadRecord = asRecord(payload);
-      if (!payloadRecord) throw malformedRemoteMcpResponse();
-      const topLevelElicitation = extractMcpElicitationRequest(payloadRecord);
-      if (topLevelElicitation) {
-        await requestElicitationForRecordedToolCall({
-          session,
-          tool,
-          invocationId,
-          request: topLevelElicitation,
-        });
-      }
-      if (payloadRecord.error !== undefined) {
-        const errorRecord = asRecord(payloadRecord.error);
-        await markRemoteConnectionHealth(
-          connection,
-          "error",
-          "Remote MCP server returned a JSON-RPC error.",
-        );
-        throw new ToolGatewayHttpError(
-          502,
-          "Remote MCP server returned an error",
-          "remote_mcp_error",
-          {
-            code:
-              typeof errorRecord?.code === "number" ? errorRecord.code : null,
-            connectionId: connection.id,
-            catalogEntryId: entry.id,
-            execution,
-          },
-        );
-      }
-      if (!Object.prototype.hasOwnProperty.call(payloadRecord, "result")) {
-        throw malformedRemoteMcpResponse();
-      }
-      const resultElicitation = extractMcpElicitationRequest(
-        payloadRecord.result,
-      );
-      if (resultElicitation) {
-        await requestElicitationForRecordedToolCall({
-          session,
-          tool,
-          invocationId,
-          request: resultElicitation,
-        });
-      }
-      const sourceTemplateKey =
-        typeof connection.config.sourceTemplateKey === "string"
-          ? connection.config.sourceTemplateKey
+
+      // A revoked grant or disabled connection is rejected before this point
+      // by `resolveConnectedRemoteTool`/`resolveConnectionGrant`, so a session
+      // can never be reused past it; the entry it leaves behind is swept by the
+      // idle/absolute deadline below.
+      const statefulSession = connection.config.mcpSessionRequired === true;
+      // A persistent session needs a run and an agent to scope and to log
+      // against. A Composio child session is already short-lived and can be
+      // re-minted onto a new endpoint mid-call, so it keeps the old path.
+      const persistentScope =
+        statefulSession && !composioChild && session.runId && session.agentId
+          ? {
+              companyId: session.companyId,
+              runId: session.runId,
+              agentId: session.agentId,
+            }
           : null;
-      const result = normalizeMcpToolResult(
-        payloadRecord.result,
-        "mcp_http",
-        false,
-        sourceTemplateKey,
-      );
-      await markRemoteConnectionHealth(
-        connection,
-        "ok",
-        "Remote MCP server responded to tools/call.",
-      );
-      return { result, headerSummary, execution };
+      if (!persistentScope) {
+        const sessionHeaders = statefulSession
+          ? mcpHttpSessionHeaders(await openMcpSession())
+          : {};
+        return await completeToolCall(await dispatchToolCall(sessionHeaders));
+      }
+      const sessionRequestHeaders = (identity: McpHttpSessionIdentity) =>
+        mcpHttpRequestHeaders({
+          ...headers,
+          ...mcpHttpSessionHeaders(identity),
+        });
+      return await persistentMcpSessions.withSession<RemoteHttpExecutionResult>({
+        scope: {
+          ...persistentScope,
+          // Every part here was re-resolved and re-authorized by this call.
+          // A difference in any of them is a different session, never a reuse.
+          parts: [
+            ["actorType", session.actorType ?? null],
+            ["actorId", session.actorId ?? null],
+            ["responsibleUserId", session.responsibleUserId ?? null],
+            ["grantOwnerUserId", grant.subjectUserId ?? null],
+            ["gatewayId", session.gatewayId ?? null],
+            ["gatewayProfileId", session.gatewayProfileId ?? null],
+            ["gatewayTokenId", session.gatewayTokenId ?? null],
+            ["connectionId", connection.id],
+            ["grantId", grant.id],
+            ["issueId", session.issueId ?? null],
+            ["projectId", session.projectId ?? null],
+          ],
+        },
+        // A rotated credential or grant is an authorization change; a rewritten
+        // endpoint or connection configuration is a configuration change. Both
+        // end the current session with an explicit reason.
+        authorizationParts: [
+          ["grantKind", grant.kind],
+          ["grantStatus", grant.status],
+          ["credentials", credentialHeaderDigest(credentialHeaders)],
+        ],
+        configurationParts: [
+          ["endpoint", endpoint],
+          ["connectionStatus", connection.status],
+          ["connectionEnabled", String(connection.enabled)],
+          ["connectionConfig", connectionConfigurationDigest(connection)],
+        ],
+        authorizationExpiresAt: session.expiresAt,
+        open: openMcpSession,
+        ping: async (identity) => {
+          const response = await dispatchRemote(endpoint, {
+            method: "POST",
+            redirect: "manual",
+            headers: sessionRequestHeaders(identity),
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: `${requestId}-ping`,
+              method: "ping",
+              params: {},
+            }),
+          });
+          await readBoundedRemoteResponse(response).catch(() => "");
+          // Only a transport-level failure counts as a dead session. A server
+          // that answers with a JSON-RPC error (an unimplemented ping, say) is
+          // still holding the session, and killing it would lose real state.
+          if (!response.ok) {
+            throw new Error(`Remote MCP ping returned HTTP ${response.status}`);
+          }
+        },
+        closeSession: async (identity) => {
+          if (!identity.sessionId) return;
+          const response = await dispatchRemote(endpoint, {
+            method: "DELETE",
+            redirect: "manual",
+            headers: sessionRequestHeaders(identity),
+          });
+          await readBoundedRemoteResponse(response).catch(() => "");
+        },
+        dispatch: async (identity) => {
+          const response = await dispatchToolCall(
+            mcpHttpSessionHeaders(identity),
+          );
+          if (response.status === 404) {
+            // Streamable HTTP answers 404 once the server has dropped the
+            // session. Report the loss; never re-initialize and retry here,
+            // because this call's outcome is unknown.
+            await readBoundedRemoteResponse(response).catch(() => "");
+            return { outcome: "session_expired" };
+          }
+          return {
+            outcome: "ok",
+            value: await completeToolCall(response),
+            closeSession: closesMcpSession(entry.toolName),
+          };
+        },
+      });
     } catch (error) {
+      if (error instanceof McpSessionLostError) {
+        throw new ToolGatewayHttpError(
+          409,
+          "The persistent MCP session was lost; retry the operation to start a new session",
+          MCP_SESSION_LOST_REASON_CODE,
+          {
+            reason: error.reason,
+            generation: error.generation,
+            connectionId: connection.id,
+            catalogEntryId: entry.id,
+            execution,
+          },
+        );
+      }
       if (error instanceof ToolGatewayHttpError) {
         throw new ToolGatewayHttpError(
           error.status,
@@ -10813,6 +11033,20 @@ export function createToolGatewayService(
         },
       });
       return { ...sessionView, revokedAt: session!.revokedAt ?? now };
+    },
+
+    /**
+     * Tear down every live persistent MCP session this process owns. Call on
+     * shutdown so the durable log records the loss instead of leaving a record
+     * that looks live to the next process.
+     */
+    async shutdownPersistentMcpSessions() {
+      await persistentMcpSessions.shutdown();
+    },
+
+    /** Non-secret view of the persistent MCP sessions this process owns. */
+    describePersistentMcpSessions() {
+      return persistentMcpSessions.describe();
     },
 
     async cleanupExpiredSessions(input: { now?: Date } = {}) {
