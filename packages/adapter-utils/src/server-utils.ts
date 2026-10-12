@@ -1915,28 +1915,158 @@ export function normalizePaperclipWakePayload(
   };
 }
 
+const PAPERCLIP_WAKE_PAYLOAD_ENV_MAX_BYTES = 96 * 1024;
+
+function clipWakeString(value: string | null | undefined, maxChars = 512) {
+  return value ? value.slice(0, maxChars) : null;
+}
+
+function compactExecutionContinuation(
+  continuation: ExecutionContinuationEnvelope | null,
+) {
+  if (!continuation) return null;
+  return {
+    version: 1 as const,
+    companyId: clipWakeString(continuation.companyId) ?? "",
+    issueId: clipWakeString(continuation.issueId) ?? "",
+    trigger: {
+      reason: clipWakeString(continuation.trigger.reason) ?? "",
+      interactionId: clipWakeString(continuation.trigger.interactionId),
+      sourceRunId: clipWakeString(continuation.trigger.sourceRunId),
+    },
+    originCommentIds: continuation.originCommentIds
+      .slice(0, 25)
+      .map((id) => clipWakeString(id, 256) ?? ""),
+    objective: "",
+    messages: [],
+    interactionOutcomes: [],
+    completedWork: null,
+    unresolvedInteractionIds: continuation.unresolvedInteractionIds
+      .slice(0, 25)
+      .map((id) => clipWakeString(id, 256) ?? ""),
+    coverage: {
+      kind: continuation.coverage.kind,
+      ...(continuation.coverage.baseRunId
+        ? { baseRunId: clipWakeString(continuation.coverage.baseRunId) ?? undefined }
+        : {}),
+      throughCommentId: clipWakeString(continuation.coverage.throughCommentId),
+      summaryThroughCommentId: null,
+    },
+  };
+}
+
+function compactPaperclipWakePayload(normalized: PaperclipWakePayload) {
+  return {
+    ...normalized,
+    executionContinuation: compactExecutionContinuation(
+      normalized.executionContinuation,
+    ),
+    issue: normalized.issue
+      ? {
+          ...normalized.issue,
+          description: null,
+          descriptionTruncated:
+            normalized.issue.descriptionTruncated ||
+            normalized.issue.description !== null,
+        }
+      : null,
+    continuationSummary: null,
+    planReviewContext: null,
+    documentReviewContext: null,
+    annotationDeltas: [],
+    checkboxSelection: null,
+    questionResponse: normalized.questionResponse
+      ? {
+          ...normalized.questionResponse,
+          summaryMarkdown:
+            "Response omitted from the environment payload; fetch the interaction.",
+          truncated: true,
+        }
+      : null,
+    agentMessage: normalized.agentMessage
+      ? {
+          text: "Message omitted from the environment payload; fetch issue context.",
+          source: normalized.agentMessage.source,
+          pluginKey: normalized.agentMessage.pluginKey,
+          sessionId: normalized.agentMessage.sessionId,
+        }
+      : null,
+    childIssueSummaries: normalized.childIssueSummaries.map((summary) => ({
+      ...summary,
+      summary: null,
+    })),
+    childIssueSummaryTruncated:
+      normalized.childIssueSummaryTruncated ||
+      normalized.childIssueSummaries.length > 0,
+    comments: [],
+    includedCount: 0,
+    missingCount: Math.max(
+      normalized.missingCount,
+      normalized.requestedCount,
+      normalized.comments.length,
+    ),
+    truncated: true,
+    fallbackFetchNeeded: true,
+  };
+}
+
 export function stringifyPaperclipWakePayload(
   value: unknown,
   options: {
     // For prompt-embedded copies of the payload on lanes where another prompt
-    // section already carries the issue description; the env-var copy should
-    // stay complete.
+    // section already carries the issue description.
     omitIssueDescription?: boolean;
   } = {},
 ): string | null {
   const normalized = normalizePaperclipWakePayload(value);
   if (!normalized) return null;
-  if (options.omitIssueDescription === true && normalized.issue) {
-    return JSON.stringify({
-      ...normalized,
-      issue: {
-        ...normalized.issue,
-        description: null,
-        descriptionTruncated: false,
-      },
-    });
-  }
-  return JSON.stringify(normalized);
+  const serializable =
+    options.omitIssueDescription === true && normalized.issue
+      ? {
+          ...normalized,
+          issue: {
+            ...normalized.issue,
+            description: null,
+            descriptionTruncated: false,
+          },
+        }
+      : normalized;
+  const serialized = JSON.stringify(serializable);
+  if (Buffer.byteLength(serialized, "utf8") < PAPERCLIP_WAKE_PAYLOAD_ENV_MAX_BYTES)
+    return serialized;
+
+  const compact = JSON.stringify(compactPaperclipWakePayload(normalized));
+  if (Buffer.byteLength(compact, "utf8") < PAPERCLIP_WAKE_PAYLOAD_ENV_MAX_BYTES)
+    return compact;
+
+  // Fail closed to a bounded routing envelope if even authority metadata is
+  // malformed or abnormally large. The full task remains available via API.
+  return JSON.stringify({
+    reason: clipWakeString(normalized.reason, 256),
+    issue: normalized.issue
+      ? {
+          id: clipWakeString(normalized.issue.id, 256),
+          identifier: clipWakeString(normalized.issue.identifier, 256),
+          title: clipWakeString(normalized.issue.title),
+          description: null,
+          descriptionTruncated: true,
+          status: clipWakeString(normalized.issue.status, 128),
+          workMode: clipWakeString(normalized.issue.workMode, 128),
+          priority: clipWakeString(normalized.issue.priority, 128),
+        }
+      : null,
+    checkedOutByHarness: normalized.checkedOutByHarness,
+    externalChatExecutionBound: normalized.externalChatExecutionBound,
+    externalChatProvider: normalized.externalChatProvider,
+    externalChatQuestionResponse: normalized.externalChatQuestionResponse,
+    skillTest: normalized.skillTest,
+    interactionId: clipWakeString(normalized.interactionId, 256),
+    sourceRunId: clipWakeString(normalized.sourceRunId, 256),
+    interactionKind: clipWakeString(normalized.interactionKind, 128),
+    interactionStatus: clipWakeString(normalized.interactionStatus, 128),
+    truncated: true,
+    fallbackFetchNeeded: true,
+  });
 }
 
 export function isPaperclipRecoveryWakePayload(value: unknown): boolean {

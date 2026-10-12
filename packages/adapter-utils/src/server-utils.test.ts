@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -3357,6 +3357,97 @@ describe("renderPaperclipWakePrompt - task watchdog", () => {
     expect(
       parsed.taskWatchdog.terminalLeafSummaries.length,
     ).toBeLessThanOrEqual(25);
+  });
+});
+
+describe("wake payload environment serialization", () => {
+  it("compacts oversized wake context before placing it in a child environment", () => {
+    const oversizedText = "x".repeat(140_000);
+    const serialized = stringifyPaperclipWakePayload({
+      reason: "issue_assigned",
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-1",
+        title: "Investigate a large wake",
+        description: oversizedText,
+        status: "in_progress",
+        workMode: "standard",
+        priority: "high",
+      },
+      executionContinuation: {
+        version: 1,
+        companyId: "company-1",
+        issueId: "issue-1",
+        trigger: {
+          reason: "issue_assigned",
+          interactionId: "interaction-1",
+          sourceRunId: "run-1",
+        },
+        originCommentIds: ["comment-1"],
+        objective: oversizedText,
+        messages: [],
+        interactionOutcomes: [],
+        completedWork: null,
+        unresolvedInteractionIds: ["interaction-1"],
+        coverage: {
+          kind: "full_task_history",
+          throughCommentId: "comment-1",
+          summaryThroughCommentId: null,
+        },
+      },
+      comments: [],
+      requestedCount: 0,
+      includedCount: 0,
+      missingCount: 0,
+      fallbackFetchNeeded: false,
+    });
+
+    expect(serialized).not.toBeNull();
+    expect(Buffer.byteLength(serialized ?? "", "utf8")).toBeLessThan(96 * 1024);
+    expect(JSON.parse(serialized ?? "{}")).toMatchObject({
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-1",
+        description: null,
+        descriptionTruncated: true,
+      },
+      executionContinuation: {
+        companyId: "company-1",
+        issueId: "issue-1",
+        trigger: {
+          interactionId: "interaction-1",
+          sourceRunId: "run-1",
+        },
+      },
+      truncated: true,
+      fallbackFetchNeeded: true,
+    });
+
+    const child = spawnSync(process.execPath, ["-e", ""], {
+      env: { PAPERCLIP_WAKE_PAYLOAD_JSON: serialized ?? "" },
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+
+    const malformedMetadata = stringifyPaperclipWakePayload({
+      reason: oversizedText,
+      issue: { id: "issue-1", title: oversizedText },
+      taskWatchdog: {
+        watchedIssueId: "issue-1",
+        capabilities: {
+          operations: [oversizedText],
+          targetScope: { excludedOriginKinds: [oversizedText] },
+        },
+      },
+    });
+    expect(Buffer.byteLength(malformedMetadata ?? "", "utf8")).toBeLessThan(
+      96 * 1024,
+    );
+    expect(JSON.parse(malformedMetadata ?? "{}")).toMatchObject({
+      issue: { id: "issue-1" },
+      truncated: true,
+      fallbackFetchNeeded: true,
+    });
   });
 });
 
