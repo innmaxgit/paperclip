@@ -1,8 +1,19 @@
+import { cloudWarmStandbyMiddleware } from "./middleware/cloud-warm-standby.js";
+import type { CloudWarmStandby } from "./services/cloud-warm-standby.js";
+import { browserUseRoutes } from "./routes/browser-use.js";
+import { browserUseService } from "./services/browser-use.js";
+import { slackToolRoutes } from "./routes/slack-tools.js";
+import { createPublicMcpOAuth, publicMcpConfig } from "./services/public-mcp/oauth.js";
+import { createMcpApiDispatch, createPublicMcpExecutor } from "./services/public-mcp/capabilities.js";
+import { createPublicMcpEvents, type PublicMcpEvents } from "./services/public-mcp/events.js";
+import { publicMcpIngressRoutes, publicMcpManagementRoutes } from "./routes/public-mcp.js";
+import { agentAvatarRoutes } from "./routes/agent-avatars.js";
 import { aiConnectionRoutes } from "./routes/ai-connections.js";
 import { projectToolRoutes } from "./routes/project-tools.js";
 import { emailChannelService } from "./services/email-channels.js";
 import { emailRoutes, emailWebhookRoutes } from "./routes/email.js";
 import { toolActionDeliveryService } from "./services/tool-action-delivery.js";
+import { registerAssignedMcpGateway } from "./services/native-runtime/assigned-mcp-tools.js";
 import express, { Router, type Request as ExpressRequest } from "express";
 import {
   createServer as createHttpServer,
@@ -119,7 +130,6 @@ import { adapterRoutes } from "./routes/adapters.js";
 import { managedAgentProfileRoutes } from "./routes/managed-agent-profiles.js";
 import { remoteAgentProfileRoutes } from "./routes/remote-agent-profiles.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
-import { injectCloudUiSnippet } from "./cloud-ui-snippet.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { staticUiCacheControl } from "./static-ui-cache.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -131,10 +141,12 @@ import {
 } from "./services/plugin-loader.js";
 import {
   SELF_HOSTED_AUTO_INSTALL_KEYS,
+  BUNDLED_PLUGIN_CATALOG,
   ensureBundledPlugins,
   resolveBundledCatalogRoot,
   resolveBundledPluginInstalls,
 } from "./services/bundled-plugins.js";
+import { readDistributionPluginCatalog, distributionPluginActivationGuard } from "./services/distribution-plugin-catalog.js";
 import {
   createPluginWorkerManager,
   type PluginWorkerManager,
@@ -455,6 +467,7 @@ export function createManagedBundledPluginWorkerRecovery(input: {
 export async function createApp(
   db: Db,
   opts: {
+    cloudWarmStandby?: CloudWarmStandby;
     uiMode: UiMode;
     serverPort: number;
     storageService: StorageService;
@@ -499,7 +512,17 @@ export async function createApp(
   },
 ) {
   const app = express();
+  const staticUi = express.Router();
   app.locals.paperclipDb = db;
+  const isWarmStandby = opts.cloudWarmStandby ?? (() => false);
+  const health = healthRoutes(db, {
+    deploymentMode: opts.deploymentMode,
+    deploymentExposure: opts.deploymentExposure,
+    authReady: opts.authReady,
+    companyDeletionEnabled: opts.companyDeletionEnabled,
+    databaseBackupHealth: opts.databaseBackupHealth,
+    isWarmStandby,
+  });
   const captureRawBody = (
     req: express.Request,
     _res: express.Response,
@@ -551,7 +574,17 @@ export async function createApp(
       bindHost: opts.bindHost,
     }),
   );
+  let mcpConfig: ReturnType<typeof publicMcpConfig> = null;
+  try { mcpConfig = publicMcpConfig(process.env, opts.authPublicBaseUrl); }
+  catch { logger.warn("Assistant connections require an HTTPS public URL (HTTP loopback is allowed for development)."); }
+  const publicMcpOAuth = mcpConfig ? createPublicMcpOAuth(db, mcpConfig) : null;
+  const publicMcpIngress = Router();
+
   app.use(cloudRuntimeIdentityMiddleware(db));
+  // A signed claim above commits identity before any normal request can seed
+  // company data. Unclaimed probes bypass session resolution as well as SQL.
+  app.use(cloudWarmStandbyMiddleware(isWarmStandby, health, staticUi));
+  app.use(publicMcpIngress);
   // Connection-intent tools carry their own short-lived, run-bound bearer and
   // must be reachable by remote adapters that intentionally do not receive an
   // agent API key. Every request revalidates the active heartbeat row.
@@ -589,18 +622,33 @@ export async function createApp(
   // Provider-authenticated ingress is intentionally outside the board
   // mutation guard. The Chat SDK adapter verifies the provider signature
   // before Paperclip persists or acts on any event.
-  const emailChannels = emailChannelService(db, { heartbeat: connectionIntentHeartbeat, storage: opts.storageService, publicBaseUrl: opts.chatWebhookPublicBaseUrl ?? opts.authPublicBaseUrl });
+  const emailChannels = emailChannelService(db, {
+    isBackgroundWorkEnabled: () => !isWarmStandby(),
+    heartbeat: connectionIntentHeartbeat,
+    storage: opts.storageService,
+    publicBaseUrl: opts.chatWebhookPublicBaseUrl ?? opts.authPublicBaseUrl,
+  });
   app.use(emailWebhookRoutes(emailChannels));
   app.use(chatWebhookRoutes(chatChannels));
+  // The instance validates single-use registration state and its trusted
+  // current origin. This exact GET is the only public setup return.
+  app.get("/api/chat-github/manifest/callback", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.set("Referrer-Policy", "no-referrer");
+    const redirect = await chatChannels.completeGitHubRegistration(String(req.query.state ?? ""), String(req.query.code ?? ""));
+    res.redirect(303, redirect);
+  });
   const managedAutoInstallKeys = opts.managedPluginAutoInstall ?? null;
   const bundledCatalogRoot =
     opts.bundledPluginCatalogRoot ?? resolveBundledCatalogRoot(process.env);
+  const distributionPlugins = readDistributionPluginCatalog(bundledCatalogRoot, BUNDLED_PLUGIN_CATALOG);
   const bundledPluginInstalls = resolveBundledPluginInstalls(
     managedAutoInstallKeys ?? SELF_HOSTED_AUTO_INSTALL_KEYS,
     {
       catalogRoot: bundledCatalogRoot,
       env: process.env,
       enforceCatalogRoot: managedAutoInstallKeys !== null,
+      distributionPlugins,
     },
   );
   const managedBundledPluginKeys =
@@ -623,17 +671,10 @@ export async function createApp(
 
   // Mount API routes
   const api = Router();
+  const agentAvatars = agentAvatarRoutes();
+  api.use(agentAvatars.router);
   api.use(boardMutationGuard());
-  api.use(
-    "/health",
-    healthRoutes(db, {
-      deploymentMode: opts.deploymentMode,
-      deploymentExposure: opts.deploymentExposure,
-      authReady: opts.authReady,
-      companyDeletionEnabled: opts.companyDeletionEnabled,
-      databaseBackupHealth: opts.databaseBackupHealth,
-    }),
-  );
+  api.use("/health", health);
   api.use(openApiRoutes());
   api.use("/cloud", cloudRoutes());
   api.use("/companies", companyRoutes(db, opts.storageService));
@@ -733,7 +774,7 @@ export async function createApp(
   api.use(projectToolRoutes(db));
   api.use(projectRoutes(db));
   api.use(caseRoutes(db, opts.storageService));
-  api.use(issueTreeControlRoutes(db));
+  api.use(issueTreeControlRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(fileResourceRoutes(db));
   api.use(routineRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(pipelineRoutes(db));
@@ -792,6 +833,7 @@ export async function createApp(
   const jobStore = pluginJobStore(db);
   const lifecycle = pluginLifecycleManager(db, { workerManager });
   const scheduler = createPluginJobScheduler({
+    isBackgroundWorkEnabled: () => !isWarmStandby(),
     db,
     jobStore,
     workerManager,
@@ -826,7 +868,9 @@ export async function createApp(
     approveToolActionRequest: (input) => toolGateway.approveActionRequest(input),
     declineToolActionRequest: (input) => toolGateway.declineActionRequest(input),
   }));
+  api.use(slackToolRoutes(db, opts.authPublicBaseUrl));
   app.locals.toolGateway = toolGateway;
+  registerAssignedMcpGateway(db, toolGateway);
   app.locals.toolActionDeliveries = toolActionDeliveries;
   app.use(mcpGatewayProtocolRoutes(toolGateway));
   api.use(aiConnectionRoutes(db, { deploymentMode: opts.deploymentMode, deploymentExposure: opts.deploymentExposure, trustedLocalStdioRuntimeHost }));
@@ -866,6 +910,7 @@ export async function createApp(
     {
       localPluginDir: opts.localPluginDir ?? DEFAULT_LOCAL_PLUGIN_DIR,
       migrationDb: opts.pluginMigrationDb,
+      assertPackageActivation: distributionPluginActivationGuard(bundledCatalogRoot, distributionPlugins, managedAutoInstallKeys),
     },
     {
       workerManager,
@@ -876,7 +921,7 @@ export async function createApp(
       lifecycleManager: lifecycle,
       instanceInfo: {
         instanceId: opts.instanceId ?? "default",
-        hostVersion: opts.hostVersion ?? "0.0.0",
+        hostVersion: opts.hostVersion ?? serverVersion,
         deploymentMode: opts.deploymentMode,
         deploymentExposure: opts.deploymentExposure,
       },
@@ -906,6 +951,10 @@ export async function createApp(
     },
   );
   runtimePluginLoader = loader;
+  const browserUse = browserUseService(db, undefined,
+    { cancelWorkForScope: heartbeatService(db, { pluginWorkerManager: workerManager }).cancelBudgetScopeWork },
+    (session, run) => toolGateway.browserUseSessionAuthorized({ ...session, runId: run.heartbeatRunId, invocationId: run.invocationId }));
+  api.use(browserUseRoutes(db, browserUse));
   api.use(toolGatewayRoutes(db, toolGateway));
   api.use(
     pluginRoutes(
@@ -934,6 +983,17 @@ export async function createApp(
       authPublicBaseUrl: opts.authPublicBaseUrl,
     }),
   );
+  let publicMcpEvents: PublicMcpEvents | null = null;
+  if (publicMcpOAuth) {
+    const dispatch = createMcpApiDispatch(api);
+    publicMcpEvents = createPublicMcpEvents(db, publicMcpOAuth, dispatch, {
+      isBackgroundWorkEnabled: () => !isWarmStandby(),
+    });
+    publicMcpEvents.start();
+    publicMcpIngress.use(publicMcpIngressRoutes(publicMcpOAuth, createPublicMcpExecutor(db, publicMcpOAuth, dispatch), publicMcpEvents));
+    api.use(publicMcpManagementRoutes(publicMcpOAuth));
+  }
+
   app.use("/api", api);
   app.use("/api", (_req, res) => {
     res.status(404).json({ error: "API route not found" });
@@ -957,7 +1017,7 @@ export async function createApp(
     if (uiDist) {
       // Hashed asset files (Vite emits them under /assets/<name>.<hash>.<ext>)
       // never change once built, so they can be cached aggressively.
-      app.use(
+      staticUi.use(
         "/assets",
         express.static(path.join(uiDist, "assets"), {
           maxAge: "1y",
@@ -965,14 +1025,14 @@ export async function createApp(
         }),
       );
       // Serve root/index through the same runtime HTML transform as SPA routes.
-      app.get(["/", "/index.html"], (_req, res) => {
+      staticUi.get(["/", "/index.html"], (_req, res) => {
         res.type("html").set("Cache-Control", "no-cache").send(readBrandedStaticIndexHtml(uiDist));
       });
       // Non-hashed static files (favicon.ico, manifest, robots.txt, etc.):
       // short cache so operators who swap them out see the new version
       // reasonably fast, with must-revalidate overrides for index.html and
       // sw.js (see staticUiCacheControl for why those two).
-      app.use(
+      staticUi.use(
         express.static(uiDist, {
           maxAge: "1h",
           setHeaders(res, filePath) {
@@ -989,7 +1049,7 @@ export async function createApp(
       // with a MIME-type error, and cache that broken response. Return 404
       // instead. The index.html response itself is no-cache so a subsequent
       // deploy's updated asset hashes are picked up on next load.
-      app.get(/.*/, (req, res) => {
+      staticUi.get(/.*/, (req, res) => {
         if (req.path.startsWith("/assets/")) {
           res.status(404).end();
           return;
@@ -1076,14 +1136,14 @@ export async function createApp(
     viteHtmlRenderer = createCachedViteHtmlRenderer({
       vite,
       uiRoot,
-      brandHtml: (html) => injectCloudUiSnippet(applyUiBranding(html)),
+      brandHtml: applyUiBranding,
     });
     const renderViteHtml = viteHtmlRenderer;
 
     if (fs.existsSync(publicUiRoot)) {
-      app.use(express.static(publicUiRoot, { index: false }));
+      staticUi.use(express.static(publicUiRoot, { index: false }));
     }
-    app.get(/.*/, async (req, res, next) => {
+    staticUi.get(/.*/, async (req, res, next) => {
       if (!shouldServeViteDevHtml(req)) {
         next();
         return;
@@ -1095,9 +1155,10 @@ export async function createApp(
         next(err);
       }
     });
-    app.use(vite.middlewares);
+    staticUi.use(vite.middlewares);
   }
 
+  app.use(staticUi);
   app.use(errorHandler);
 
   jobCoordinator.start();
@@ -1112,7 +1173,7 @@ export async function createApp(
     }
   };
   const flushPendingFeedbackExports = async () => {
-    if (feedbackExportShuttingDown) return;
+    if (feedbackExportShuttingDown || isWarmStandby()) return;
     try {
       await opts.feedbackExportService?.flushPendingFeedbackTraces();
     } catch (err) {
@@ -1161,24 +1222,25 @@ export async function createApp(
   });
   const unsubscribeChatPublicationSignals = subscribeAllCompanyLiveEvents(
     (event) => {
-      if (isChatPublicationCommitSignal(event))
+      if (!isWarmStandby() && isChatPublicationCommitSignal(event))
         chatReconciliation.notifyPublications();
     },
   );
   let chatPublicationTimer: ReturnType<typeof setInterval> | null = setInterval(
     () => {
-      chatReconciliation.reconcile();
+      if (!isWarmStandby()) chatReconciliation.reconcile();
     },
     CHAT_PUBLICATION_FLUSH_INTERVAL_MS,
   );
   chatPublicationTimer.unref?.();
-  chatReconciliation.reconcile();
+  if (!isWarmStandby()) chatReconciliation.reconcile();
   // Abandoned chunked-import spool sweep: hourly (plus once at startup),
   // deleting spool dirs whose transfer saw no activity for 24h and cancelling
   // their still-open ledger runs. Same setInterval + unref + shutdown-clear
   // shape as the feedback export flush above.
   const importTransferSpoolRoot = resolveDefaultImportTransferSpoolRoot();
   const sweepImportTransferSpools = () => {
+    if (isWarmStandby()) return;
     sweepAbandonedImportTransferSpools(db, importTransferSpoolRoot)
       .then((result) => {
         if (result.swept > 0) {
@@ -1192,6 +1254,12 @@ export async function createApp(
         );
       });
   };
+  const browserUseTimer = setInterval(() => {
+    if (isWarmStandby()) return;
+    void browserUse.sweep().catch(() => logger.warn("Browser Use reconciliation failed; retrying."));
+  }, 3000);
+  browserUseTimer.unref?.();
+  if (!isWarmStandby()) void browserUse.sweep().catch(() => logger.warn("Browser Use startup reconciliation failed; retrying."));
   let importTransferSweepTimer: ReturnType<typeof setInterval> | null =
     setInterval(
       sweepImportTransferSpools,
@@ -1264,7 +1332,8 @@ export async function createApp(
     { registry: pluginRegistry, loader, lifecycle, logger },
     // Managed mode reinstalls soft-uninstalled bundles (the control plane
     // owns provisioning); self-hosted leaves an operator's uninstall alone.
-    // Operator-DISABLED plugins are never touched in either mode.
+    // Disabled plugins never start automatically. Added distribution permissions
+    // still enter upgrade_pending so enabling them requires an operator decision.
     { reinstallUninstalled: managedAutoInstallKeys !== null },
   )
     .then(() => loader.loadAll())
@@ -1290,6 +1359,7 @@ export async function createApp(
       // The scheduler tick queries the database. Stop it here, inside the
       // awaited teardown, so no tick runs after the caller ends the pool.
       scheduler.stop();
+      await publicMcpEvents?.stop();
       jobCoordinator.stop();
       disableFeedbackExportFlushes();
       unsubscribeChatPublicationSignals();
@@ -1299,6 +1369,7 @@ export async function createApp(
         chatPublicationTimer = null;
       }
       await chatReconciliation.drain();
+      clearInterval(browserUseTimer);
       if (importTransferSweepTimer) {
         clearInterval(importTransferSweepTimer);
         importTransferSweepTimer = null;
@@ -1315,6 +1386,9 @@ export async function createApp(
       // the durable run log then records the loss instead of leaving a record
       // that still looks live to the next process.
       await toolGateway.shutdownPersistentMcpSessions();
+      // End the avatar worker pool, if a request ever started one, so no
+      // render outlives the HTTP teardown.
+      await agentAvatars.close();
       // Cancel every live setup-token login session and AWAIT the cancellation,
       // so each direct child stops and the server releases each lease before the
       // caller stops the database and the provider. A lease release that

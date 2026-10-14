@@ -11,6 +11,12 @@ async function failureMessage(response: APIResponse, method: string) {
 
 export class RunnerApi {
   readonly baseURL: string;
+  private browserCookie?: string;
+
+  setBrowserSession(cookie: string) { this.browserCookie = cookie; }
+  private sessionOptions() {
+    return this.browserCookie ? { headers: { Cookie: this.browserCookie, Origin: this.baseURL } } : {};
+  }
 
   constructor(readonly request: APIRequestContext) {
     const port = process.env.PAPERCLIP_RUNNER_E2E_PORT?.trim();
@@ -19,13 +25,13 @@ export class RunnerApi {
   }
 
   async get<T>(path: string): Promise<T> {
-    const response = await this.request.get(path);
+    const response = await this.request.get(path, this.sessionOptions());
     if (!response.ok()) throw new Error(await failureMessage(response, "GET"));
     return response.json() as Promise<T>;
   }
 
   async post<T>(path: string, data?: unknown): Promise<T> {
-    const response = await this.request.post(path, { data });
+    const response = await this.request.post(path, { data, ...this.sessionOptions() });
     if (!response.ok()) throw new Error(await failureMessage(response, "POST"));
     return response.json() as Promise<T>;
   }
@@ -38,7 +44,7 @@ export class RunnerApi {
   async postSensitive<T>(path: string, data: unknown): Promise<T> {
     const response = await fetch(new URL(path, this.baseURL), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...this.sessionOptions().headers },
       body: JSON.stringify(data),
     });
     if (!response.ok) {
@@ -50,17 +56,35 @@ export class RunnerApi {
   }
 
   async patch<T>(path: string, data: unknown): Promise<T> {
-    const response = await this.request.patch(path, { data });
+    const response = await this.request.patch(path, { data, ...this.sessionOptions() });
     if (!response.ok())
       throw new Error(await failureMessage(response, "PATCH"));
     return response.json() as Promise<T>;
+  }
+
+  /** Use the public revision fence when configuring a fixture's instruction entry. */
+  async saveAgentInstructions(agentId: string, content: string): Promise<void> {
+    const path = `/api/agents/${agentId}/instructions-bundle/file`;
+    const current = await this.request.get(`${path}?path=AGENTS.md`);
+    let baseHash: string | null = null;
+    if (current.ok()) {
+      const detail = await current.json();
+      if (typeof detail.contentHash !== "string" || !detail.contentHash) {
+        throw new Error("Existing fixture instructions have no revision hash");
+      }
+      baseHash = detail.contentHash;
+    } else if (current.status() !== 404) {
+      throw new Error(await failureMessage(current, "GET"));
+    }
+    const saved = await this.request.put(path, { data: { path: "AGENTS.md", content, baseHash } });
+    if (!saved.ok()) throw new Error(await failureMessage(saved, "PUT"));
   }
 
   async delete(
     path: string,
     options?: { allowNotFound?: boolean },
   ): Promise<void> {
-    const response = await this.request.delete(path);
+    const response = await this.request.delete(path, this.sessionOptions());
     if (response.ok() || (options?.allowNotFound && response.status() === 404))
       return;
     throw new Error(await failureMessage(response, "DELETE"));
@@ -68,8 +92,8 @@ export class RunnerApi {
 }
 
 export class ObservedStateTimeout extends Error {
-  constructor(label: string, readonly failureClass: "candidate_failure" | "transient_infrastructure") {
-    super(`Timed out waiting for ${label}; the observed state did not satisfy the condition. See the saved state evidence.`);
+  constructor(label: string, readonly failureClass: "candidate_failure" | "transient_infrastructure", detail?: string) {
+    super(`Timed out waiting for ${label}; ${detail ?? "the observed state did not satisfy the condition"}. See the saved state evidence.`);
     this.name = "ObservedStateTimeout";
   }
 }
@@ -82,6 +106,7 @@ export async function pollUntil<T>(input: {
   reject?: (value: T) => string | undefined;
   intervalMs?: number;
   timeoutFailureClass?: "candidate_failure" | "transient_infrastructure";
+  timeoutDetail?: (value: T | undefined) => string | undefined;
 }): Promise<T> {
   let last: T | undefined;
   let lastError: unknown;
@@ -110,5 +135,9 @@ export async function pollUntil<T>(input: {
   if (lastError instanceof Error) {
     throw new Error(`Timed out waiting for ${input.label}: ${lastError.message}`, { cause: lastError });
   }
-  throw new ObservedStateTimeout(input.label, input.timeoutFailureClass ?? "candidate_failure");
+  throw new ObservedStateTimeout(
+    input.label,
+    input.timeoutFailureClass ?? "candidate_failure",
+    input.timeoutDetail?.(last),
+  );
 }
