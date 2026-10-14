@@ -3671,25 +3671,23 @@ export function SkillDetailPage({
                 {updateSettingsPending ? "Saving…" : "Save settings"}
               </Button>
             </div>
-            {detail.editable ? (
-              <div className="rounded-md border border-destructive/40 p-3">
-                <div className="text-xs font-semibold uppercase tracking-wide text-destructive">Danger zone</div>
-                <div className="mt-2 flex items-center justify-between gap-3">
-                  <p className="min-w-0 text-xs text-muted-foreground">Remove this skill from the organization library.</p>
-                  <Button
-                    variant="destructive"
-                    size="sm"
-                    className="shrink-0"
-                    onClick={onDelete}
-                    disabled={deletePending}
-                    title={detail.usedByAgents.length > 0 ? "Detach this skill from all agents before removing it." : undefined}
-                  >
-                    <Trash2 className="mr-1.5 h-3.5 w-3.5" />
-                    {deletePending ? "Removing…" : "Remove"}
-                  </Button>
-                </div>
+            <div className="rounded-md border border-destructive/40 p-3">
+              <div className="text-xs font-semibold uppercase tracking-wide text-destructive">Danger zone</div>
+              <div className="mt-2 flex items-center justify-between gap-3">
+                <p className="min-w-0 text-xs text-muted-foreground">Remove this skill from the organization library.</p>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  className="shrink-0"
+                  onClick={onDelete}
+                  disabled={deletePending}
+                  title={detail.usedByAgents.length > 0 ? "Detach this skill from all agents before removing it." : undefined}
+                >
+                  <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+                  {deletePending ? "Removing…" : "Remove"}
+                </Button>
               </div>
-            ) : null}
+            </div>
           </div>
         </DialogContent>
       </Dialog>
@@ -5228,9 +5226,14 @@ export function CompanySkills() {
           <div className="space-y-3 text-sm">
             <p>
               {deleteTargetDetail
-                ? `You are about to remove ${deleteTargetDetail.name}.`
+                ? `You are about to remove ${deleteTargetDetail.name}, installed from ${sourceMeta(deleteTargetDetail.sourceBadge, deleteTargetDetail.sourceLabel).label}.`
                 : "You are about to remove this skill."}
             </p>
+            {deleteTargetDetail?.sourceType === "github" || deleteTargetDetail?.sourceType === "skills_sh" ? (
+              <p className="text-muted-foreground">
+                Only Paperclip&apos;s installed copy and managed files will be removed. The source repository will not be changed.
+              </p>
+            ) : null}
             {deleteTargetDetail?.usedByAgents?.length ? (
               <div className="rounded-md border border-border px-3 py-3 text-muted-foreground">
                 Currently used by {deleteTargetDetail.usedByAgents.map((agent) => agent.name).join(", ")}.

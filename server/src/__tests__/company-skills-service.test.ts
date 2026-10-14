@@ -196,6 +196,59 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     } finally { vi.unstubAllGlobals(); }
   });
 
+  it("deletes GitHub and skills.sh installs without crossing company boundaries", async () => {
+    const companyId = randomUUID();
+    const otherCompanyId = randomUUID();
+    await db.insert(companies).values([
+      { id: companyId, name: "Remote delete", issuePrefix: `T${companyId.slice(0, 6)}` },
+      { id: otherCompanyId, name: "Remote delete other", issuePrefix: `T${otherCompanyId.slice(0, 6)}` },
+    ]);
+    const revision = "a".repeat(40);
+    const upstream = vi.fn(async (input: string | URL, _init?: RequestInit) => {
+      const url = String(input);
+      const skillsShRepo = url.includes("/acme/skills");
+      const repo = skillsShRepo ? "skills" : "github-skill";
+      const slug = skillsShRepo ? "skills-sh-skill" : "github-skill";
+      if (url.endsWith(`/repos/acme/${repo}`)) return Response.json({ default_branch: "main" });
+      if (url.includes(`/repos/acme/${repo}/commits/`)) return Response.json({ sha: revision });
+      if (url.includes(`/repos/acme/${repo}/git/trees/`)) {
+        return Response.json({ tree: [{ path: `${slug}/SKILL.md`, type: "blob" }] });
+      }
+      if (url.endsWith(`/${slug}/SKILL.md`)) {
+        return new Response(`---\nname: ${slug}\ndescription: Remote delete fixture\n---\n# ${slug}\n`);
+      }
+      return new Response("Not found", { status: 404 });
+    });
+    vi.stubGlobal("fetch", upstream);
+    try {
+      const github = (await svc.importFromSource(companyId, "https://github.com/acme/github-skill")).imported[0]!;
+      const skillsSh = (await svc.importFromSource(companyId, "https://skills.sh/acme/skills/skills-sh-skill")).imported[0]!;
+      const otherCompanyGithub = (await svc.importFromSource(otherCompanyId, "https://github.com/acme/github-skill")).imported[0]!;
+
+      expect(github.sourceType).toBe("github");
+      expect(skillsSh.sourceType).toBe("skills_sh");
+
+      const runtimeEntries = await svc.listRuntimeSkillEntries(companyId);
+      const githubRuntime = runtimeEntries.find((entry) => entry.key === github.key)!;
+      const skillsShRuntime = runtimeEntries.find((entry) => entry.key === skillsSh.key)!;
+      expect(githubRuntime.sourceStatus).toBe("available");
+      expect(skillsShRuntime.sourceStatus).toBe("available");
+
+      expect(await svc.deleteSkill(otherCompanyId, github.id)).toBeNull();
+      expect(await svc.getById(companyId, github.id)).not.toBeNull();
+
+      await svc.deleteSkill(companyId, github.id);
+      await svc.deleteSkill(companyId, skillsSh.id);
+
+      expect(await svc.getById(companyId, github.id)).toBeNull();
+      expect(await svc.getById(companyId, skillsSh.id)).toBeNull();
+      expect(await svc.getById(otherCompanyId, otherCompanyGithub.id)).not.toBeNull();
+      await expect(fs.stat(githubRuntime.source)).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(fs.stat(skillsShRuntime.source)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(upstream.mock.calls.every(([, init]) => !init || init.method === undefined || init.method === "GET")).toBe(true);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   it("observes edits to a direct local source on the next preparation", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Local cache", issuePrefix: `T${companyId.slice(0, 6)}` });

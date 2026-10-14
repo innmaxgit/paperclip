@@ -824,6 +824,31 @@ describe("SkillDetailPage settings", () => {
     expect(onFork).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    { sourceType: "github" as const, sourceBadge: "github" as const, sourceLabel: "GitHub" },
+    { sourceType: "skills_sh" as const, sourceBadge: "skills_sh" as const, sourceLabel: "skills.sh" },
+  ])("offers removal for read-only $sourceLabel skills", async ({ sourceType, sourceBadge, sourceLabel }) => {
+    const v1 = makeVersion(1, "# Demo Skill");
+    const onDelete = vi.fn();
+    const node = await renderSkillDetail([v1], {
+      activeTab: "overview",
+      detail: makeDetail(v1, {
+        editable: false,
+        editableReason: `${sourceLabel} skills are read-only.`,
+        sourceType,
+        sourceBadge,
+        sourceLabel,
+      }),
+      onDelete,
+    });
+
+    await click(buttonsNamed(node, "Settings")[0] as HTMLButtonElement);
+    const dialog = node.querySelector('[role="dialog"]') as HTMLElement;
+    await click(buttonsNamed(dialog, "Remove")[0] as HTMLButtonElement);
+
+    expect(onDelete).toHaveBeenCalledOnce();
+  });
+
   it("renders long source paths in full so they can wrap inside the sidebar", async () => {
     const v1 = makeVersion(1, "# Demo Skill");
     const longSourcePath = "/srv/paperclip/home/paperclipai/paperclip/.agents/skills/prepare-pr/SKILL.md";
