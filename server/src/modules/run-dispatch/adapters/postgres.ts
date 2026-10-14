@@ -1,5 +1,6 @@
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
 import { and, asc, eq, gte, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -17,8 +18,10 @@ import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
 import { parseObject } from "../../../adapters/utils.js";
 import { evaluateAgentInvokabilityFromDb } from "../../../services/agent-invokability.js";
 import { budgetService } from "../../../services/budgets.js";
+import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../../../services/heartbeat-policy.js";
 import { collectDispositionRepairSourceState } from "../../../services/recovery/disposition-repair.js";
+import { legacyDispositionEpisode, legacyDispositionFingerprint } from "../../../services/recovery/legacy-continuation.js";
 import { appendHeartbeatRunEvent } from "../../../services/heartbeat-run-events.js";
 import { emitAgentTaskRun } from "../../../services/agent-task-run-telemetry.js";
 import { issueService } from "../../../services/issues.js";
@@ -106,6 +109,17 @@ const NO_REVIEW_PARTICIPANT: ReviewParticipantFacts = {
   currentParticipant: null,
 };
 
+async function readNativeReviewParticipantFacts(db: Db, input: {
+  companyId: string; issueId: string; agentId: string; contextSnapshot: unknown;
+}): Promise<ReviewParticipantFacts | null> {
+  const review = await getNativeReviewAssignment(db, input);
+  return review ? {
+    isInReview: true, hasParticipant: true, participantIsAgent: true,
+    participantAgentId: input.agentId, currentStageType: "native_completion_review",
+    currentParticipant: { type: "agent", agentId: input.agentId, interactionId: review.interaction.id },
+  } : null;
+}
+
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
@@ -113,8 +127,8 @@ function readNonEmptyString(value: unknown): string | null {
 function classifyRetryReasonKind(retryReason: string | null): RetryReasonKind {
   if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON) return "max_turn_continuation";
   if (retryReason === ISSUE_DISPOSITION_REPAIR_RETRY_REASON) return "disposition_repair";
-  if (retryReason === "ai_connection_busy") return "ai_connection_wait";
-  if (retryReason === "native_safe_replacement") return "native_safe_replacement";
+  if ((retryReason === "ai_connection_busy" || retryReason === "ai_connection_pool_wait")) return "ai_connection_wait";
+  if (retryReason === "native_safe_replacement" || retryReason === "native_provider_overloaded") return "native_safe_replacement";
   return "other";
 }
 
@@ -360,7 +374,10 @@ export function createPostgresRunDispatchAdapter(
       ]);
       facts.pendingResponse = interactions.length > 0 ? "interaction" : linkedApprovals.length > 0 ? "approval" : null;
     }
-    facts.reviewParticipant = buildReviewParticipantFacts({
+    facts.reviewParticipant = await readNativeReviewParticipantFacts(dbOrTx, {
+      companyId: input.companyId, issueId, agentId: input.agentId,
+      contextSnapshot: input.contextSnapshot,
+    }) ?? buildReviewParticipantFacts({
       isInReview: issue.status === "in_review",
       executionState: parseIssueExecutionState(issue.executionState),
     });
@@ -376,13 +393,31 @@ export function createPostgresRunDispatchAdapter(
         excludeRunId: input.runId,
         excludeWakeupRequestId: input.wakeupRequestId,
       });
+      let currentFingerprint = sourceState.fingerprint;
+      let validSource = true;
+      if (readNonEmptyString(parseObject(input.contextSnapshot.legacyDispositionEpisode).id)) {
+        // Legacy repair reserves a slot in a persisted episode. Its fingerprint
+        // identifies that episode, not the older parked-summary state snapshot.
+        // Still recheck every active/wait/ownership gate before promotion.
+        const episode = legacyDispositionEpisode({ id: input.runId, contextSnapshot: input.contextSnapshot });
+        const sourceId = readNonEmptyString(input.contextSnapshot.dispositionRepairSourceRunId)
+          ?? readNonEmptyString(input.contextSnapshot.retryOfRunId);
+        const source = sourceId ? await dbOrTx.select().from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.id, sourceId), eq(heartbeatRuns.companyId, input.companyId),
+        )).limit(1).then(rows => rows[0]) : null;
+        validSource = Boolean(source && source.status === "succeeded" && source.agentId === input.agentId
+          && (source.contextSnapshot?.issueId ?? source.contextSnapshot?.taskId) === issueId
+          && legacyDispositionEpisode(source).id === episode.id
+          && episode.attempt >= 1 && episode.attempt <= episode.maxAttempts);
+        currentFingerprint = legacyDispositionFingerprint(input.companyId, issueId, input.agentId, episode.id);
+      }
       facts.dispositionRepair = {
         expectedFingerprintPresent: expectedFingerprint !== null,
-        fingerprintMatches: sourceState.fingerprint === expectedFingerprint,
+        fingerprintMatches: validSource && currentFingerprint === expectedFingerprint,
         hasActiveExecutionPath: sourceState.hasActiveExecutionPath,
         hasDurableWaitingPath: sourceState.hasDurableWaitingPath,
         expectedFingerprint,
-        currentFingerprint: sourceState.fingerprint,
+        currentFingerprint,
         durablePathReason: sourceState.durablePathReason,
       };
     }
@@ -574,13 +609,20 @@ export function createPostgresRunDispatchAdapter(
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,
       wakeCommentIdPresent: Boolean(wakeCommentId),
+      isCompletedOnboardingHandoffWake: await isCompletedOnboardingHandoffWake(dbOrTx, {
+        companyId: input.companyId, issueId, agentId: input.agentId,
+        reason: wakeReason, contextSnapshot: context,
+      }),
       continuationParkApplies,
       continuationParksExecutor,
       continuationSummaryBody,
       wakeReason,
       retryReason,
       reviewParticipant: issue
-        ? buildReviewParticipantFacts({
+        ? await readNativeReviewParticipantFacts(dbOrTx, {
+            companyId: input.companyId, issueId, agentId: input.agentId,
+            contextSnapshot: context,
+          }) ?? buildReviewParticipantFacts({
             isInReview: issue.status === "in_review",
             executionState: issue.status === "in_review" ? parseIssueExecutionState(issue.executionState) : null,
           })

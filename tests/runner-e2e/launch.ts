@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { prepareCodexCiSandbox } from "./codex-ci-sandbox.js";
+import { prepareCodexCiSandbox, requiresCodexCiSandbox } from "./codex-ci-sandbox.js";
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { createRequire } from "node:module";
@@ -21,7 +21,8 @@ import {
 import { isImmutableDaytonaImage, runnerMatrix } from "./catalog.js";
 import { renderRunnerE2EDashboard } from "./dashboard.js";
 import { packageEvidence } from "./evidence.js";
-import { classifyFailure, shouldRetryFailure } from "./failure-classifier.js";
+import { classifyFailure } from "./failure-classifier.js";
+import { effectiveAutomaticRetryLimit, executeWithAutomaticRetry } from "./automatic-retry.js";
 import { buildRunnerCampaign } from "./history.js";
 import {
   buildRunnerE2EProcessEnvironment,
@@ -49,6 +50,11 @@ import {
   type MatrixExecution,
   type RunnerE2EResult,
 } from "./types.js";
+import { assertRunnerE2EPrerequisites } from "./prerequisites.js";
+import { assertNativeCompletionSelection, prepareNativeCompletionPreflight, NATIVE_COMPLETION_PREFLIGHT_ENV } from "./native-completion-admission.js";
+import { assertNativeInstructionSelection, prepareNativeInstructionPreflight, NATIVE_INSTRUCTION_PREFLIGHT_ENV, NATIVE_INSTRUCTION_SUITE } from "./native-instruction-consolidation.js";
+import { prepareStockHarnessPreflight, STOCK_PREFLIGHT_ENV } from "./stock-harness-admission.js";
+
 import {
   reapNewDetachedDarwinSharedMemory,
   snapshotDarwinSharedMemory,
@@ -647,7 +653,7 @@ async function runAttempt(input: {
       temporaryRoot,
       process.env.PATH,
     );
-    if (execution.environment.id === "local" && execution.profile.id === "runner-codex") {
+    if (requiresCodexCiSandbox(execution)) {
       await prepareCodexCiSandbox(repositoryRoot, temporaryRoot);
     }
     const agentJwtSecret = secret(48);
@@ -673,6 +679,7 @@ async function runAttempt(input: {
         executions.map((candidate) => candidate.id),
       ),
       PAPERCLIP_RUNNER_E2E_ATTEMPT: String(attempt),
+      PAPERCLIP_RUNNER_E2E_PUBLIC_MCP: executions.some(candidate => candidate.task.flow === "public_mcp") ? "1" : "0",
       PAPERCLIP_RUNNER_E2E_PORT: String(port),
       PAPERCLIP_RUNNER_E2E_TEMP_ROOT: temporaryRoot,
       PAPERCLIP_RUNNER_E2E_PRIVATE_DIR: privateDir,
@@ -778,42 +785,50 @@ async function runAttempt(input: {
       isolationError = error;
     }
     let persistedStateError: unknown;
-    try {
-      const expectedEphemeralCredentials = new Set<string>();
-      for (const [label, directory] of [
-        ["Paperclip home", paperclipHome],
-        ["workspace", workspace],
-      ] as const) {
-        while (true) {
-          // The managed Codex home may legitimately contain upstream source-code
-          // fixtures with fake `sk-*` strings. Reject exact campaign credentials.
-          const leak = await findSecretLeakInDirectory(directory, credentials, {
-            includeShapes: false,
-            ignoreFile: (file) => expectedEphemeralCredentials.has(file),
-            allowDisappearedFile: (file) =>
-              label === "Paperclip home" && isEphemeralPostgresScanFile(paperclipHome, file),
-          });
-          if (!leak) break;
-          const isManagedCodexRuntimeAuth =
-            label === "Paperclip home" &&
-            isEphemeralCodexRuntimeAuthFile(paperclipHome, leak.file);
-          if (isManagedCodexRuntimeAuth) {
-            const metadata = await lstat(leak.file);
-            if (metadata.isFile() && (metadata.mode & 0o777) === 0o600) {
-              // Codex CLI API-key mode requires this one runtime auth file. It
-              // lives only in the disposable cell root, is never published,
-              // must be owner-only, and is removed with the root below.
-              expectedEphemeralCredentials.add(leak.file);
-              continue;
+    // Onboarding evaluates behavior; credential persistence belongs to a separate layer.
+    // Keep artifact redaction/publication checks independent of this filesystem scan.
+    const persistenceCheckedExecutions = executions.filter(
+      (candidate) => candidate.suite.id !== "first-task",
+    );
+    if (persistenceCheckedExecutions.length > 0) {
+      try {
+        const expectedEphemeralCredentials = new Set<string>();
+        for (const [label, directory] of [
+          ["Paperclip home", paperclipHome],
+          ["workspace", workspace],
+        ] as const) {
+          while (true) {
+            // The managed Codex home may legitimately contain upstream source-code
+            // fixtures with fake `sk-*` strings. Reject exact campaign credentials.
+            const leak = await findSecretLeakInDirectory(directory, credentials, {
+              includeShapes: false,
+              ignoreFile: (file) => expectedEphemeralCredentials.has(file),
+              allowDisappearedFile: (file) =>
+                label === "Paperclip home" &&
+                isEphemeralPostgresScanFile(paperclipHome, file),
+            });
+            if (!leak) break;
+            const isManagedCodexRuntimeAuth =
+              label === "Paperclip home" &&
+              isEphemeralCodexRuntimeAuthFile(paperclipHome, leak.file);
+            if (isManagedCodexRuntimeAuth) {
+              const metadata = await lstat(leak.file);
+              if (metadata.isFile() && (metadata.mode & 0o777) === 0o600) {
+                // Codex CLI API-key mode requires this one runtime auth file. It
+                // lives only in the disposable cell root, is never published,
+                // must be owner-only, and is removed with the root below.
+                expectedEphemeralCredentials.add(leak.file);
+                continue;
+              }
             }
+            throw new Error(
+              `Secret leak in persisted ${label} state at ${path.relative(temporaryRoot, leak.file)}: ${leak.reason}`,
+            );
           }
-          throw new Error(
-            `Secret leak in persisted ${label} state at ${path.relative(temporaryRoot, leak.file)}: ${leak.reason}`,
-          );
         }
+      } catch (error) {
+        persistedStateError = error;
       }
-    } catch (error) {
-      persistedStateError = error;
     }
     for (const [index, candidate] of executions.entries()) {
       let result = results[index];
@@ -843,7 +858,7 @@ async function runAttempt(input: {
             : isolationMessage,
         };
       }
-      if (persistedStateError) {
+      if (persistedStateError && persistenceCheckedExecutions.includes(candidate)) {
         const persistedStateMessage =
           persistedStateError instanceof Error
             ? persistedStateError.message
@@ -1005,35 +1020,19 @@ async function runExecutionWithRetry(input: {
   options: ReturnType<typeof parseRunnerSelectors>;
 }): Promise<RunnerE2EResult> {
   const { execution, campaignId, options } = input;
-  const [firstResult] = await runAttempt({
-    executions: [execution],
-    attempt: 1,
-    campaignId,
-    options,
+  return executeWithAutomaticRetry({
+    task: execution.task, options,
+    qualificationCandidate: execution.profile.qualificationCandidate !== undefined,
+    cancelled: () => cancelled,
+    onRetry: result => console.warn(
+      `Retrying ${execution.id} in a fresh isolated harness after ${result.failureClass!.replaceAll("_", " ")}`,
+    ),
+    runAttempt: async attempt => {
+      const [result] = await runAttempt({ executions: [execution], attempt, campaignId, options });
+      if (!result) throw new Error(`No result produced for ${execution.id} attempt ${attempt}`);
+      return result;
+    },
   });
-  if (!firstResult) throw new Error(`No result produced for ${execution.id}`);
-  if (
-    options.ui ||
-    options.debug ||
-    firstResult.status !== "failed" ||
-    !firstResult.failureClass ||
-    !shouldRetryFailure(firstResult.failureClass)
-  ) {
-    return firstResult;
-  }
-  if (cancelled) throw new Error("Runner E2E campaign cancelled");
-  console.warn(
-    `Retrying ${execution.id} in a fresh isolated harness after ${firstResult.failureClass.replaceAll("_", " ")}`,
-  );
-  const [retryResult] = await runAttempt({
-    executions: [execution],
-    attempt: 2,
-    campaignId,
-    options,
-  });
-  if (!retryResult)
-    throw new Error(`No retry result produced for ${execution.id}`);
-  return retryResult;
 }
 
 async function runWithConcurrency<T, R>(
@@ -1085,6 +1084,27 @@ async function main() {
     return;
   }
 
+  // Keep admission before local-env loading and credential checks. Pending
+  // profiles remain discoverable, but cannot reach a provider.
+  assertRunnerE2EPrerequisites(executions);
+  assertNativeCompletionSelection(executions);
+  assertNativeInstructionSelection(executions);
+  const campaignId = cleanId(
+    process.env.PAPERCLIP_E2E_CAMPAIGN_ID ??
+      `local-${new Date().toISOString().replace(/[:.]/g, "-")}`,
+  );
+  const summaryDir = path.join(resultsRoot, campaignId);
+  await mkdir(summaryDir, { recursive: true });
+  if (executions.some(execution => execution.suite.id === "native-completion")) {
+    process.env[NATIVE_COMPLETION_PREFLIGHT_ENV] = prepareNativeCompletionPreflight(summaryDir);
+  }
+  if (executions.some(execution => execution.suite.id === NATIVE_INSTRUCTION_SUITE)) {
+    process.env[NATIVE_INSTRUCTION_PREFLIGHT_ENV] = prepareNativeInstructionPreflight(summaryDir);
+  }
+  if (executions.some(execution => execution.suite.id === "stock-harness")) {
+    process.env[STOCK_PREFLIGHT_ENV] = prepareStockHarnessPreflight(summaryDir);
+  }
+
   await loadLocalEnvironment(process.env);
   const missingCredentials = [
     ...new Set(
@@ -1105,9 +1125,24 @@ async function main() {
     );
   }
 
-  const campaignId = cleanId(
-    process.env.PAPERCLIP_E2E_CAMPAIGN_ID ??
-      `local-${new Date().toISOString().replace(/[:.]/g, "-")}`,
+
+  await writeFile(
+    path.join(summaryDir, "invocation-policy.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        maxAutomaticRetries: options.maxAutomaticRetries,
+        retryClasses: ["transient_infrastructure", "provider_variance"],
+        executions: executions.map(execution => ({
+          executionId: execution.id,
+          automaticRetryPolicy: execution.task.automaticRetryPolicy ?? "default",
+          maxAutomaticRetries: effectiveAutomaticRetryLimit(execution.task, options.maxAutomaticRetries),
+        })),
+      },
+      null,
+      2,
+    )}\n`,
+    "utf8",
   );
   const requestedParallelism =
     options.headed || options.ui || options.debug ? 1 : options.maxParallel;
@@ -1127,8 +1162,6 @@ async function main() {
     expected: executions.map((execution) => execution.id),
     results: finalResults,
   });
-  const summaryDir = path.join(resultsRoot, campaignId);
-  await mkdir(summaryDir, { recursive: true });
   const campaignSecrets = normalizedSecrets(
     CREDENTIAL_NAMES.map((name) => process.env[name]),
   );

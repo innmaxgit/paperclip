@@ -3,7 +3,7 @@ import type { Logger } from "pino";
 import { pinoHttp } from "pino-http";
 import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
 import {
-  isPrivateChatWebhookHttpRequest,
+  isPrivateWebhookHttpRequest,
   isSecretSensitiveHttpRequest,
   shouldSilenceHttpSuccessLog,
 } from "./http-log-policy.js";
@@ -56,10 +56,16 @@ function isPrivateWebhook(req: {
   originalUrl?: unknown;
   url?: unknown;
 }) {
-  return isPrivateChatWebhookHttpRequest(
+  return isPrivateWebhookHttpRequest(
     req.method,
     requestClassificationUrl(req),
   );
+}
+
+function privateWebhookLogUrl(url: unknown) {
+  return typeof url === "string" && /\/routine-triggers\/public(?:\/|$)/i.test(url)
+    ? "/api/routine-triggers/public/:publicId/fire"
+    : "/api/chat-webhooks/:publicId/:provider";
 }
 
 function requestLogUrl(req: {
@@ -68,7 +74,7 @@ function requestLogUrl(req: {
   url?: unknown;
 }) {
   return isPrivateWebhook(req)
-    ? "/api/chat-webhooks/:publicId/:provider"
+    ? privateWebhookLogUrl(requestClassificationUrl(req))
     : stripSecretBearingUrlParts(typeof req.url === "string" ? req.url : "");
 }
 
@@ -89,7 +95,7 @@ export function createHttpLogger(baseLogger: Logger) {
           return {
             id: req.id,
             method: req.method,
-            url: "/api/chat-webhooks/:publicId/:provider",
+            url: privateWebhookLogUrl(req.url),
           };
         }
         return {
@@ -156,6 +162,9 @@ export function createHttpLogger(baseLogger: Logger) {
     customProps(req, res) {
       if (res.statusCode >= 400) {
         const ctx = (res as any).__errorContext;
+        if (/^\/mcp\/(?:oauth|paperclip)(?:\/|$)/.test(requestClassificationUrl(req) ?? "")) {
+          return { reqBody: "[REDACTED]", ...(ctx ? { errorContext: { name: "Error" } } : {}) };
+        }
         if (isPrivateWebhook(req)) {
           // Omit, rather than recursively redact, the entire provider payload.
           // This applies equally before/after parsing and with/without context.

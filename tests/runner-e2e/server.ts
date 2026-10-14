@@ -1,3 +1,5 @@
+import { runnerE2ETypeScriptProcessArgs } from "./web-server-command.js";
+import { qualifyLegacyClaudeCli } from "./legacy-claude-cli.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -21,8 +23,7 @@ const paperclipHome = required("PAPERCLIP_HOME");
 const configPath = required("PAPERCLIP_CONFIG");
 const port = required("PAPERCLIP_RUNNER_E2E_PORT");
 const repositoryRoot = path.resolve(import.meta.dirname, "../..");
-const tsxCli = path.join(repositoryRoot, "cli/node_modules/tsx/dist/cli.mjs");
-const paperclipCli = path.join(repositoryRoot, "cli/src/index.ts");
+const paperclipCli = path.join(repositoryRoot, "tests/runner-e2e/server-entry.ts");
 const {
   controlDirectory,
   restartRequestPath,
@@ -49,7 +50,16 @@ const serverEnvironment = buildPaperclipServerEnvironment(process.env, {
   BETTER_AUTH_SECRET: required("BETTER_AUTH_SECRET"),
   PAPERCLIP_BIND: "loopback",
   PAPERCLIP_BIND_HOST: "127.0.0.1",
-  PAPERCLIP_DEPLOYMENT_MODE: "local_trusted",
+  PAPERCLIP_DEPLOYMENT_MODE: process.env.PAPERCLIP_RUNNER_E2E_PUBLIC_MCP === "1" ? "authenticated" : "local_trusted",
+  ...(process.env.PAPERCLIP_RUNNER_E2E_PUBLIC_MCP === "1" ? {
+    PAPERCLIP_PUBLIC_URL: `http://127.0.0.1:${port}`,
+    PAPERCLIP_AUTH_PUBLIC_BASE_URL: `http://127.0.0.1:${port}`,
+    PAPERCLIP_AUTH_BASE_URL_MODE: "explicit",
+    // Use empty provider configuration as the managed homes' seed. A local
+    // operator's installed plugins, MCP connections and auth are not fixtures.
+    CODEX_HOME: path.join(temporaryRoot, "provider-config", "codex"),
+    CLAUDE_CONFIG_DIR: path.join(temporaryRoot, "provider-config", "claude"),
+  } : {}),
   PAPERCLIP_DEPLOYMENT_EXPOSURE: "private",
   SERVE_UI: "true",
   PAPERCLIP_STORAGE_PROVIDER: "local_disk",
@@ -76,6 +86,10 @@ const definedServerEnvironment = Object.fromEntries(
 await Promise.all([
   mkdir(path.dirname(logPath), { recursive: true }),
   mkdir(controlDirectory, { recursive: true, mode: 0o700 }),
+  ...(process.env.PAPERCLIP_RUNNER_E2E_PUBLIC_MCP === "1" ? [
+    mkdir(path.join(temporaryRoot, "provider-config", "codex"), { recursive: true, mode: 0o700 }),
+    mkdir(path.join(temporaryRoot, "provider-config", "claude"), { recursive: true, mode: 0o700 }),
+  ] : []),
 ]);
 const log = createWriteStream(logPath, { flags: "a", mode: 0o600 });
 const expectedStops = new WeakSet<ChildProcess>();
@@ -110,7 +124,7 @@ function startServer() {
   }
   const candidate = spawn(
     process.execPath,
-    [tsxCli, paperclipCli, "onboard", "--yes", "--run"],
+    runnerE2ETypeScriptProcessArgs(repositoryRoot, paperclipCli, ["onboard", "--yes", "--run"]),
     {
       cwd: repositoryRoot,
       env: definedServerEnvironment,
@@ -348,6 +362,10 @@ for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
 }
 
 async function supervise() {
+  const executionIds: string[] = JSON.parse(process.env.PAPERCLIP_RUNNER_E2E_EXECUTION_IDS ?? "[]");
+  if (executionIds.some(id => id.includes(".legacy-claude.local.") || /\.assistant-claude-(?:haiku|sonnet)\.local\./.test(id))) {
+    definedServerEnvironment.PATH = await qualifyLegacyClaudeCli(temporaryRoot, definedServerEnvironment);
+  }
   const databaseReservation = await prepareRunnerE2EServerConfig({
     temporaryRoot,
     configPath,
