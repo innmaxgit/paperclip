@@ -12,6 +12,7 @@ import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 
 interface WsSocket {
   readyState: number;
+  bufferedAmount: number;
   ping(): void;
   send(data: string): void;
   terminate(): void;
@@ -39,6 +40,23 @@ const { WebSocket, WebSocketServer } = require("ws") as {
   WebSocket: { OPEN: number };
   WebSocketServer: new (opts: { noServer: boolean }) => WsServer;
 };
+
+// A client that cannot keep up would otherwise make `ws` buffer every live
+// event in server memory. Past this backlog we drop the connection; the UI
+// reconnects and refetches instead of reading a stale stream.
+export const LIVE_EVENTS_MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
+
+export function sendLiveEvent(
+  socket: Pick<WsSocket, "readyState" | "bufferedAmount" | "send" | "terminate">,
+  payload: string,
+): void {
+  if (socket.readyState !== WebSocket.OPEN) return;
+  if (socket.bufferedAmount > LIVE_EVENTS_MAX_BUFFERED_BYTES) {
+    socket.terminate();
+    return;
+  }
+  socket.send(payload);
+}
 
 interface UpgradeContext {
   companyId: string;
@@ -261,8 +279,7 @@ export function setupLiveEventsWebSocketServer(
     }
 
     const unsubscribe = subscribeCompanyLiveEvents(context.companyId, (event) => {
-      if (socket.readyState !== WebSocket.OPEN) return;
-      socket.send(JSON.stringify(event));
+      sendLiveEvent(socket, JSON.stringify(event));
     });
 
     cleanupByClient.set(socket, unsubscribe);
