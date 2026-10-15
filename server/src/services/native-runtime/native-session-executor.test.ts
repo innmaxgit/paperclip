@@ -282,6 +282,7 @@ import {
   createRemoteRunnerProcessLauncher,
   createRunnerdBackend,
   executePaperclipNativeSession,
+  releaseSessionToolAuthorityEpoch,
   detachNativeSessionsForRestart,
   NativeControllerDetachedForRestartError,
   getNativeSessionSteeringState,
@@ -10828,6 +10829,22 @@ describe("runnerd provider runtime wiring", () => {
     await expect(firstOptions.dynamicToolHandler!({})).resolves.toEqual({
       runId: "run-first",
     });
+    await expect(secondOptions.dynamicToolHandler!({})).resolves.toEqual({
+      runId: "run-second",
+    });
+
+    // Releasing on behalf of another run must not drop the current authority.
+    releaseSessionToolAuthorityEpoch({
+      ...firstExecution,
+      binding: { ...firstExecution.binding, runId: "run-other" },
+    });
+    await expect(firstOptions.dynamicToolHandler!({})).resolves.toEqual({
+      runId: "run-first",
+    });
+    releaseSessionToolAuthorityEpoch(firstExecution);
+    expect(() => firstOptions.dynamicToolHandler!({})).toThrow(
+      "native_session_tool_authority_unavailable",
+    );
     await expect(secondOptions.dynamicToolHandler!({})).resolves.toEqual({
       runId: "run-second",
     });
