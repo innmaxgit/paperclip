@@ -56,6 +56,12 @@ export const agentWakeupRequests = pgTable(
       table.agentId,
       table.requestedAt,
     ),
+    // Idempotency lookups match any status, so none of the partial unique
+    // indexes below can serve them.
+    companyIdempotencyIdx: index("agent_wakeup_requests_company_idempotency_idx").on(
+      table.companyId,
+      table.idempotencyKey,
+    ),
     reviewPathRecoveryIdempotencyUq: uniqueIndex(
       "agent_wakeup_requests_review_path_recovery_idempotency_uq",
     )

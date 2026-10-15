@@ -102,6 +102,10 @@ export const heartbeatRuns = pgTable(
       .on(table.executionStatusDeliveryId).where(sql`${table.executionStatusDeliveryId} is not null`),
     executionControlDeadlineIdx: index("heartbeat_runs_execution_control_deadline_idx")
       .on(table.executionControlDeadlineAt).where(sql`${table.executionControlDeadlineAt} is not null`),
+    // Backs the agent_wakeup_requests foreign key so deleting wakeups does not
+    // scan heartbeat_runs once per row.
+    wakeupRequestIdx: index("heartbeat_runs_wakeup_request_idx")
+      .on(table.wakeupRequestId).where(sql`${table.wakeupRequestId} is not null`),
     nativeReplacementPredecessorUq: uniqueIndex("heartbeat_runs_native_replacement_predecessor_uq")
       .on(table.companyId, table.retryOfRunId)
       .where(sql`${table.scheduledRetryReason} = 'native_safe_replacement'`),
