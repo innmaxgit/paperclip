@@ -1525,6 +1525,18 @@ class SessionToolAuthorityEpoch {
 }
 
 const sessionToolAuthorityEpochs = new Map<string, SessionToolAuthorityEpoch>();
+
+/**
+ * Drop the run's tool authority once its turn has finished so the module-level
+ * map does not retain one authority (and its closures) per session forever.
+ * A later run on the same session installs a fresh epoch.
+ */
+export function releaseSessionToolAuthorityEpoch(execution: NativeExecutionInput): void {
+  const sessionScopeId = nativeSessionScopeKey(execution);
+  if (sessionToolAuthorityEpochs.get(sessionScopeId)?.runId === execution.binding.runId) {
+    sessionToolAuthorityEpochs.delete(sessionScopeId);
+  }
+}
 const initializingSessionToolAuthorities = new Set<string>();
 const executingRunnerdSessionScopes = new Map<string, string>();
 const executingNativeOwnerScopes = new Map<string, symbol>();
@@ -7394,6 +7406,7 @@ export async function executePaperclipNativeSession(input: {
     executionFailure = error;
     throw error;
   } finally {
+    releaseSessionToolAuthorityEpoch(input.execution);
     if (executingNativeOwnerScopes.get(ownerScope) === ownerToken) {
       executingNativeOwnerScopes.delete(ownerScope);
     }

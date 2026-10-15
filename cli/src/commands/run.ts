@@ -20,6 +20,7 @@ import { assertForegroundRunAllowed } from "../services/service-manager.js";
 import { removeRuntimeInfoForPid, writeRuntimeInfo } from "../runtime-info.js";
 import { printUpdateNotice } from "../update-notice.js";
 import { ensureWorktreeSeeded } from "./worktree.js";
+import { maybeEnableUiDevMiddleware } from "./ui-dev-middleware.js";
 
 export interface RunOptions {
   config?: string;
@@ -186,14 +187,6 @@ function getMissingModuleSpecifier(err: unknown): string | null {
   const moduleMatch = err.message.match(/Cannot find module '([^']+)'/);
   if (moduleMatch?.[1]) return moduleMatch[1];
   return null;
-}
-
-function maybeEnableUiDevMiddleware(entrypoint: string): void {
-  if (process.env.PAPERCLIP_UI_DEV_MIDDLEWARE !== undefined) return;
-  const normalized = entrypoint.replaceAll("\\", "/");
-  if (normalized.endsWith("/server/src/index.ts") || normalized.endsWith("@paperclipai/server/src/index.ts")) {
-    process.env.PAPERCLIP_UI_DEV_MIDDLEWARE = "true";
-  }
 }
 
 function ensureDevWorkspaceBuildDeps(projectRoot: string): void {

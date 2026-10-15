@@ -169,6 +169,21 @@ describe("GET /health", () => {
     });
   });
 
+  it("adds process metrics only when requested", async () => {
+    const app = createApp(createHealthyDb());
+
+    const plain = await request(app).get("/health");
+    expect(plain.body).not.toHaveProperty("processMetrics");
+
+    const res = await request(app).get("/health?metrics=1");
+    expect(res.status).toBe(200);
+    expect(res.body.processMetrics).toMatchObject({
+      pid: process.pid,
+      memory: { rssBytes: expect.any(Number), heapUsedBytes: expect.any(Number) },
+      cpu: { userMicros: expect.any(Number), averagePercent: expect.any(Number) },
+    });
+  });
+
   it("returns 503 when the database probe fails", async () => {
     const db = {
       execute: vi.fn().mockRejectedValue(new Error("connect ECONNREFUSED")),

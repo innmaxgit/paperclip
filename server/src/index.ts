@@ -117,6 +117,7 @@ import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
 import { ensureDecisionSigningSecret } from "./services/decision-signing.js";
 import { createDecisionRetentionNotifyOriginAgent, createDecisionWakeOriginAgent } from "./services/decision-wakeup.js";
+import { createSkippedWakeupRetentionSweep } from "./services/wakeup-request-retention.js";
 import {
   closeHttpListenerForShutdown,
   coordinateHeartbeatSchedulerShutdown,
@@ -1643,6 +1644,7 @@ async function startServerWithDatabaseTeardown(
       return { archived, ...notifications };
     };
     await runRetentionSweep();
+    const runSkippedWakeupRetentionSweep = createSkippedWakeupRetentionSweep(db as any);
 
     startHeartbeatSchedulerInterval(() => {
       // Track the outer async callback as well as the work it starts. Shutdown
@@ -1655,6 +1657,9 @@ async function startServerWithDatabaseTeardown(
         }));
         trackHeartbeatSchedulerWork(runRetentionSweep().catch((err: unknown) => {
           logger.error({ err }, "decision retention sweep failed");
+        }));
+        trackHeartbeatSchedulerWork(runSkippedWakeupRetentionSweep().catch((err: unknown) => {
+          logger.error({ err }, "skipped wakeup retention sweep failed");
         }));
         const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
         if (sweptRuntimeStatuses > 0) {

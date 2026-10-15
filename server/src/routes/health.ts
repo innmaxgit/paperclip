@@ -13,6 +13,7 @@ import {
 } from "../dev-server-status.js";
 import { logger } from "../middleware/logger.js";
 import { getServerInfoSnapshot, type ServerInfoSnapshot } from "../server-info.js";
+import { getProcessMetricsSnapshot } from "../process-metrics.js";
 import {
   getCloudStackContext,
   isCloudManagedInstance,
@@ -427,6 +428,12 @@ export function healthRoutes(
       return;
     }
 
+    // Opt-in (?metrics=1) so the frequently polled default response stays unchanged.
+    const processMetrics =
+      req.query.metrics === "1" || req.query.metrics === "true"
+        ? getProcessMetricsSnapshot()
+        : undefined;
+
     res.json({
       status: healthStatus,
       version: serverVersion,
@@ -450,6 +457,7 @@ export function healthRoutes(
       ...(workspaceReadiness ? { workspace: workspaceReadiness } : {}),
       ...(cloud ? { cloud } : {}),
       ...(hiddenSettings.length ? { hiddenSettings } : {}),
+      ...(processMetrics ? { processMetrics } : {}),
     });
   });
 
