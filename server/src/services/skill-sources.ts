@@ -243,16 +243,26 @@ export function skillSourceService(db: Db) {
     await context.authorize('skills.import', { sourceType: 'git', sourceLocator: repositoryUrl });
     const scan = await scanGitHubSkills({ repositoryUrl, trackingRef, commitSha }, read);
     const existing = previous.find(source => source.trackingRef === scan.trackingRef || (source.trackingRef === 'HEAD' && scan.trackingRef === scan.defaultBranch));
-    const selectedPaths = scan.candidates.filter(candidate =>
+    const matched = scan.candidates.filter(candidate =>
       (!prefix || candidate.path === prefix || candidate.path.startsWith(`${prefix}/`)) &&
       (!parsed.requestedSkillSlug || normalizeAgentUrlKey(candidate.name) === parsed.requestedSkillSlug || candidate.path.split('/').at(-2) === parsed.requestedSkillSlug)
-    ).map(candidate => candidate.path);
-    if (!selectedPaths.length) throw unprocessable('No matching SKILL.md files were found in this repository.');
+    );
+    if (!matched.length) throw unprocessable('No matching SKILL.md files were found in this repository.');
+    // Inspection failures must surface here. Selecting a rejected package lets
+    // publish() skip it and the import returns an empty `imported` list with the
+    // real reason buried in warnings.
+    const selectedPaths = matched.filter(candidate => !candidate.error).map(candidate => candidate.path);
+    if (!selectedPaths.length) {
+      throw unprocessable(`Skill inspection rejected every matching package. ${matched.map(candidate => `${candidate.path}: ${candidate.error}`).join(' ')}`.trim());
+    }
     const result = existing
       ? await refresh(companyId, existing.id, context, { revision: existing.revision, selectedPaths: [...new Set([...existing.entries.filter(entry => entry.selection === 'selected').map(entry => entry.path), ...selectedPaths])], excludedFolders: existing.excludedFolders }, scan)
       : await create(companyId, { repositoryUrl: scan.repositoryUrl, trackingRef: scan.trackingRef, commitSha: scan.commitSha, connectionId, selectedPaths }, context, scan);
     const imported = await Promise.all(result.source.entries.filter(entry => selectedPaths.includes(entry.path) && entry.skillId && !entry.error).map(entry => skills.getById(companyId, entry.skillId!)));
-    return { imported: imported.filter((skill): skill is CompanySkill => Boolean(skill)), warnings: result.warnings };
+    // Rejected matches are not selected, so publish() never warns about them.
+    // Dedupe: an already-selected rejected path warns in publish() too.
+    const rejected = matched.filter(candidate => candidate.error).map(candidate => `${candidate.path}: ${candidate.error}`);
+    return { imported: imported.filter((skill): skill is CompanySkill => Boolean(skill)), warnings: [...new Set([...result.warnings, ...rejected])] };
   }
   return { list, detail, sourceForSkill, discover, preview, create, refresh, disconnect, importFromUrl };
 }

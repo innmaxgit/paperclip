@@ -2581,7 +2581,12 @@ async function auditInstalledSkillBytes(skill: CompanySkill): Promise<CompanySki
     }
   }
 
-  const remoteExecPattern = /\b(?:curl|wget)\b[\s\S]{0,160}\|\s*(?:sh|bash)|\b(?:bash|sh)\s+-c\b|\beval\b|\bpython\s+-c\b|\bnode\s+-e\b/i;
+  // `eval` only counts when it sits in shell command position (line start, after
+  // a shell operator, inside `$(…)`, or opening an inline code span) and is given
+  // an argument to execute. A bare \beval\b also matched documented CLI
+  // subcommands such as `playwright-cli eval "document.title"` and prose that
+  // mentions `eval`, which rejected otherwise valid skill packages.
+  const remoteExecPattern = /\b(?:curl|wget)\b[\s\S]{0,160}\|\s*(?:sh|bash)|\b(?:bash|sh)\s+-c\b|(?:^|[\n;&|`]|\$\(|[-*>][ \t])[ \t]*eval[ \t]+\S|\bpython\s+-c\b|\bnode\s+-e\b/i;
   const secretExfilPattern = /\b(?:cat|printenv|env|grep)\b[\s\S]{0,160}(?:\.aws\/credentials|\.ssh\/|\.npmrc|id_rsa|OPENAI_API_KEY|ANTHROPIC_API_KEY|API_KEY|TOKEN|SECRET)[\s\S]{0,160}\b(?:curl|wget|nc|netcat|scp)\b/i;
   const networkPattern = /\b(?:curl|wget|fetch|httpie|nc|netcat|scp|ssh)\b|https?:\/\//i;
   const secretReferencePattern = /\b(?:process\.env|printenv|\$[A-Z][A-Z0-9_]{2,}|API_KEY|TOKEN|SECRET|PASSWORD|\.env)\b/i;
