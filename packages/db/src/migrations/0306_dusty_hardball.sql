@@ -1,0 +1,3 @@
+-- paperclip:migration-safety-ignore large-create-index-not-concurrently: Drizzle migrations run transactionally, so CONCURRENTLY is unavailable. Operators with a large table can pre-create this index with CREATE INDEX CONCURRENTLY IF NOT EXISTS under the same name; this statement is then a no-op.
+CREATE INDEX IF NOT EXISTS "agent_wakeup_requests_company_idempotency_idx" ON "agent_wakeup_requests" USING btree ("company_id","idempotency_key");--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "heartbeat_runs_wakeup_request_idx" ON "heartbeat_runs" USING btree ("wakeup_request_id") WHERE "heartbeat_runs"."wakeup_request_id" is not null;
