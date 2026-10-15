@@ -419,6 +419,20 @@ This starts the UI and API at `http://localhost:3100`. An embedded PostgreSQL da
 
 Source development also builds the native Paperclip Runner when enabled (the self-hosted default). Install a Rust toolchain, or set `PAPERCLIP_RUNNER_BINARY` to a compatible prebuilt runner.
 
+### Running a long-lived instance from source
+
+If you run `pnpm paperclipai onboard` / `pnpm paperclipai run` from a source checkout as your real instance, build the UI and disable the embedded Vite dev server:
+
+```bash
+pnpm --filter @paperclipai/ui build   # re-run after every git pull
+export PAPERCLIP_UI_DEV_MIDDLEWARE=false
+pnpm paperclipai run
+```
+
+- **Why:** when the server is started from `server/src/index.ts`, the CLI turns on `PAPERCLIP_UI_DEV_MIDDLEWARE` unless `ui/dist` exists or `NODE_ENV=production` (`cli/src/commands/ui-dev-middleware.ts`). That embeds a full Vite dev server in the server process — rolldown, Tailwind oxide, a file watcher and an HMR listener on port 13100 — which is only useful while editing the UI.
+- **Effect:** the UI is served from the static `ui/dist` bundle instead. On an instance measured at ~4.7 GB RSS (5.37 GB peak), dropping Vite is expected to bring it to roughly 1–1.5 GB, removes port 13100 and the watcher, and lowers GC CPU. It does not change database query load.
+- **UI development:** use `pnpm dev`, or set `PAPERCLIP_UI_DEV_MIDDLEWARE=true` explicitly to get hot reload.
+
 <br/>
 
 ## FAQ
