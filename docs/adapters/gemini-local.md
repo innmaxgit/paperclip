@@ -19,7 +19,7 @@ The `gemini_local` adapter runs Google's Gemini CLI locally. It supports session
 | `promptTemplate` | string | No | Prompt used for all runs |
 | `instructionsFilePath` | string | No | Markdown instructions file prepended to the prompt |
 | `env` | object | No | Environment variables (supports secret refs) |
-| `timeoutSec` | number | No | Process timeout (0 = no timeout) |
+| `timeoutSec` | number | No | Process timeout (0 = 4-hour default backstop; negative disables it) |
 | `graceSec` | number | No | Grace period before force-kill |
 | `yolo` | boolean | No | Pass `--approval-mode yolo` for unattended operation |
 

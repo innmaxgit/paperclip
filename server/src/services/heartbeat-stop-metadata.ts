@@ -16,7 +16,14 @@ export interface HeartbeatRunTimeoutPolicy {
   effectiveTimeoutSec: number | null;
   effectiveTimeoutMs?: number | null;
   timeoutConfigured: boolean;
-  timeoutSource: "config" | "default" | "unknown" | "configured" | "sandbox_default" | "unlimited";
+  timeoutSource:
+    | "config"
+    | "default"
+    | "unknown"
+    | "configured"
+    | "sandbox_default"
+    | "local_default"
+    | "unlimited";
 }
 
 export interface HeartbeatRunStopMetadata extends HeartbeatRunTimeoutPolicy {
@@ -128,7 +135,8 @@ export function mergeHeartbeatRunStopMetadata(
   if (metadata.effectiveTimeoutMs == null && resolution && typeof resolution === "object" && !Array.isArray(resolution)) {
     const { timeoutSec, source } = resolution as Record<string, unknown>;
     if (typeof timeoutSec === "number" && Number.isFinite(timeoutSec) && timeoutSec >= 0 &&
-        (source === "configured" || (source === "sandbox_default" && timeoutSec > 0) ||
+        (source === "configured" ||
+         ((source === "sandbox_default" || source === "local_default") && timeoutSec > 0) ||
          (source === "unlimited" && timeoutSec === 0))) {
       timeoutPolicy = {
         effectiveTimeoutSec: timeoutSec,

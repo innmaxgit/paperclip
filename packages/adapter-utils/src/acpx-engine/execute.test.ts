@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createRuntimeStore, type AcpRuntimeOptions, type AcpSessionRecord, type AcpSessionStore } from "acpx/runtime";
 import type { AdapterExecutionContext, AdapterRuntimeMcpAccess } from "@paperclipai/adapter-utils";
 import {
+  DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC,
   DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC,
   prepareAdapterExecutionTargetRuntime,
   startAdapterExecutionTargetPaperclipBridge,
@@ -2954,7 +2955,36 @@ describe("gemini ACP flag selection", () => {
     );
   });
 
-  it("keeps local execution unlimited by default and logs the unlimited timeout", async () => {
+  it("applies the local backstop when timeoutSec is unset on a local execution target", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const cwd = path.join(root, "worktree");
+    await fs.mkdir(cwd, { recursive: true });
+
+    const { logs, runtimeOptions, result } = await runExecutor({
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir,
+      cwd,
+    });
+
+    // A local run with no configured timeout is no longer unbounded: a hung
+    // run hits the backstop instead of holding its agent slot forever.
+    expect(runtimeOptions[0]?.timeoutMs).toBe(DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC * 1000);
+    expect(result.resultJson?.adapterExecutionTimeout).toEqual({
+      timeoutSec: DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC, source: "local_default",
+    });
+    const startLine = logs.find(
+      (entry) => entry.stream === "stderr" && entry.text.includes("Adapter execution timeout:"),
+    );
+    expect(startLine).toBeTruthy();
+    expect(startLine!.text).toContain(
+      `Adapter execution timeout: timeoutSec=${DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC} ` +
+        "(local/SSH default; set adapterConfig.timeoutSec to override).",
+    );
+  });
+
+  it("honors the negative timeoutSec opt-out on a local execution target", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");
     const cwd = path.join(root, "worktree");
@@ -2965,14 +2995,17 @@ describe("gemini ACP flag selection", () => {
       agentCommand: "node ./fake-acp.js",
       stateDir,
       cwd,
+      timeoutSec: -1,
     });
 
     expect(runtimeOptions[0]?.timeoutMs).toBeUndefined();
     const startLine = logs.find(
       (entry) => entry.stream === "stderr" && entry.text.includes("Adapter execution timeout:"),
     );
-    expect(startLine).toBeTruthy();
-    expect(startLine!.text).toContain("Adapter execution timeout: none");
+    expect(startLine!.text).toContain(
+      "Adapter execution timeout: none (explicitly disabled via adapterConfig.timeoutSec; " +
+        "set it to a positive value to add one).",
+    );
   });
 
   it("prefers a configured timeoutSec over the sandbox default", async () => {

@@ -1948,8 +1948,8 @@ async function buildRuntime(input: {
     headers: [{ name: "Authorization", value: `Bearer ${server.token}` }],
   }));
   // Resolve the wall-clock timeout through the shared execution-target
-  // resolver so sandbox-backed runs pick up the 4h backstop default while
-  // local/SSH runs keep the historical "0 = no adapter timeout" behavior.
+  // resolver so every target picks up its 4h backstop default when the adapter
+  // leaves timeoutSec unset. A negative timeoutSec is the explicit opt-out.
   const timeoutResolution = resolveAdapterExecutionTargetTimeout(
     executionTarget,
     asNumber(config.timeoutSec, DEFAULT_ACP_ENGINE_TIMEOUT_SEC),

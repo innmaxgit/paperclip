@@ -49,7 +49,9 @@ describe("heartbeat stop metadata", () => {
     { target: "sandbox", configured: 90, seconds: 90, source: "configured", explicit: true },
     { target: "sandbox", configured: 0.5, seconds: 0.5, source: "configured", explicit: true },
     { target: "sandbox", configured: -1, seconds: 0, source: "configured", explicit: true },
-    { target: "local", configured: 0, seconds: 0, source: "unlimited", explicit: false },
+    { target: "local", configured: undefined, seconds: 14400, source: "local_default", explicit: false },
+    { target: "local", configured: 0, seconds: 14400, source: "local_default", explicit: false },
+    { target: "local", configured: -1, seconds: 0, source: "configured", explicit: true },
   ])("retains the resolved $target timeout for config $configured", ({ target, configured, seconds, source, explicit }) => {
     const adapterExecutionTimeout = resolveAdapterExecutionTargetTimeout(
       target === "sandbox" ? { kind: "remote", transport: "sandbox", remoteCwd: "/workspace" } : { kind: "local" },
@@ -72,7 +74,7 @@ describe("heartbeat stop metadata", () => {
     null, [], { timeoutSec: 90 }, { timeoutSec: "90", source: "configured" },
     { timeoutSec: -1, source: "configured" }, { timeoutSec: Infinity, source: "configured" },
     { timeoutSec: 90, source: "unknown" }, { timeoutSec: 90, source: "unlimited" },
-    { timeoutSec: 0, source: "sandbox_default" },
+    { timeoutSec: 0, source: "sandbox_default" }, { timeoutSec: 0, source: "local_default" },
   ])("falls back to config for an invalid adapter resolution: %j", (adapterExecutionTimeout) => {
     expect(mergeHeartbeatRunStopMetadata(
       { adapterExecutionTimeout },

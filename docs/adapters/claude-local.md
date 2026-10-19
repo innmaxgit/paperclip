@@ -32,7 +32,7 @@ subscription quota exhaustion merely because ACP labels them `limit`.
 | `model` | string | No | Claude model to use (default: `claude-opus-5`) |
 | `promptTemplate` | string | No | Prompt used for all runs |
 | `env` | object | No | Environment variables (supports secret refs) |
-| `timeoutSec` | number | No | Process timeout (0 = no timeout) |
+| `timeoutSec` | number | No | Process timeout (0 = 4-hour default backstop; negative disables it) |
 | `graceSec` | number | No | Grace period before force-kill |
 | `maxTurnsPerRun` | number | No | Max agentic turns per heartbeat (defaults to `300`) |
 | `dangerouslySkipPermissions` | boolean | No | Skip permission prompts (default: `true`); required for headless runs where interactive approval is impossible |

@@ -378,6 +378,14 @@ export { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 // and the short deadlines for bridge control operations.
 export const DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC = 14_400;
 
+// Four-hour wall-clock backstop for local and SSH adapter runs that leave
+// `timeoutSec` unset. Local/SSH runs used to have no adapter timer at all, so a
+// hung run (a stalled provider stream, a wedged child process) held its agent
+// slot forever and only a manual stop ended it. The value intentionally matches
+// the sandbox backstop so every target fails the same way; an operator who
+// really wants an unbounded run sets a negative `adapterConfig.timeoutSec`.
+export const DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC = DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC;
+
 function parseObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -559,6 +567,10 @@ export function describeAdapterExecutionTarget(
 export type AdapterExecutionTargetTimeoutSource =
   | "configured"
   | "sandbox_default"
+  | "local_default"
+  // Legacy: local/SSH runs resolved to this before they gained a default
+  // backstop. The resolver no longer returns it, but persisted run metadata
+  // and the formatters still carry it.
   | "unlimited";
 
 export interface AdapterExecutionTargetTimeoutResolution {
@@ -588,15 +600,14 @@ export function resolveAdapterExecutionTargetTimeout(
       return { timeoutSec: 0, source: "configured" };
     }
   }
-  // Local and SSH adapters preserve the historical "0 means no adapter
-  // timeout" behavior. Sandbox-backed runs execute through provider RPCs
-  // that usually apply their own shorter command defaults, so request an
-  // explicit longer timeout for full adapter runs when the adapter leaves
-  // timeoutSec unset.
+  // Every target gets the same wall-clock backstop when the adapter leaves
+  // timeoutSec unset, so a hung run fails with a self-describing timeout
+  // instead of holding its agent slot until someone stops it by hand. The two
+  // branches stay separate so the start-of-run log names which default applied.
   if (target?.kind === "remote" && target.transport === "sandbox") {
     return { timeoutSec: DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC, source: "sandbox_default" };
   }
-  return { timeoutSec: 0, source: "unlimited" };
+  return { timeoutSec: DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC, source: "local_default" };
 }
 
 export function resolveAdapterExecutionTargetTimeoutSec(
@@ -614,6 +625,8 @@ function describeAdapterExecutionTimeoutSource(
       return "configured via adapterConfig.timeoutSec";
     case "sandbox_default":
       return "sandbox default";
+    case "local_default":
+      return "local/SSH default";
     case "unlimited":
       return "no adapter wall-clock timeout";
   }

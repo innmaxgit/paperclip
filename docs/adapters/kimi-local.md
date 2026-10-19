@@ -26,7 +26,7 @@ The `kimi_local` adapter runs the Kimi Code CLI (`kimi`) locally. It has two exe
 | `command` | string | No | CLI command override. Defaults to `kimi`. |
 | `extraArgs` | string[] | No | Additional CLI arguments appended to every run |
 | `env` | object | No | Environment variables (supports secret refs) |
-| `timeoutSec` | number | No | Process timeout (0 = no timeout) |
+| `timeoutSec` | number | No | Process timeout (0 = 4-hour default backstop; negative disables it) |
 | `graceSec` | number | No | Grace period before force-kill |
 
 ## Execution Engine
