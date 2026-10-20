@@ -6,6 +6,7 @@ import {
   type AiConnectionUsageOverage,
 } from "@paperclipai/shared";
 import { parseGrokAuthPayload } from "@paperclipai/adapter-grok-local/server";
+import { claudeCredentialAccessToken } from "@paperclipai/adapter-claude-local/server";
 
 type Observation = Pick<AiConnectionUsage, "source" | "planType" | "limits" | "overage">;
 type ObjectValue = Record<string, unknown>;
@@ -169,8 +170,10 @@ async function codex(credential: string, request: typeof fetch): Promise<Observa
 }
 
 async function claude(credential: string, request: typeof fetch): Promise<Observation> {
+  // A stored Claude subscription is either a renewable credentials payload or
+  // a bare access token; the helper reads the bearer token out of either.
   const body = await readUsage("https://api.anthropic.com/api/oauth/usage", {
-    Authorization: `Bearer ${requireToken(credential)}`, "anthropic-beta": "oauth-2025-04-20",
+    Authorization: `Bearer ${requireToken(claudeCredentialAccessToken(credential))}`, "anthropic-beta": "oauth-2025-04-20",
   }, request);
   const limits: AiConnectionUsageLimit[] = [];
   const labels: Record<string, string> = {

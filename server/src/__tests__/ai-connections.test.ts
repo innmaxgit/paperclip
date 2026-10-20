@@ -540,6 +540,38 @@ describe("managed AI connections", () => {
     const stored = await service.credential(await service.select({ ...runInput, userId }));
     expect(stored).toBe(auth("newer", now + 2 * 60 * 60 * 1000));
   });
+  it("lets a Claude subscription renew itself from the run's own credentials file", async () => {
+    const userId = "claude-refresh-user";
+    await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
+    const auth = (marker: string, expiresAt: number) => JSON.stringify({ claudeAiOauth: { accessToken: `access-${marker}`, refreshToken: `refresh-${marker}`, expiresAt } });
+    const now = Date.now();
+    await service.save(companyId, userId, { provider: "anthropic", method: "subscription", ownership: "personal", name: "Claude refresh fixture", loginSessionId: "fixture", allAgents: true, agentIds: [] }, auth("start", now + 36e5));
+    const runInput = { ...input, adapterType: "claude_local", responsibleUserId: userId, binding: { provider: "anthropic", method: "subscription", mode: "responsible_user" } as const, config: { model: "same-model" } };
+    const run = await prepareManagedAiRuntime(db, runInput);
+    // A renewable credential goes in as the file the CLI refreshes in place,
+    // never as a bearer token the CLI could only use until it expires.
+    const credentials = path.join(String((run.config.env as Record<string, string>).CLAUDE_CONFIG_DIR), ".credentials.json");
+    expect(await readFile(credentials, "utf8")).toBe(auth("start", now + 36e5));
+    expect((run.config.env as Record<string, string>).CLAUDE_CODE_OAUTH_TOKEN).toBe("");
+    await writeFile(credentials, auth("refreshed", now + 72e5));
+    await run.cleanup();
+    expect(await service.credential(await service.select({ ...runInput, userId }))).toBe(auth("refreshed", now + 72e5));
+    // A run that ends with an older expiry cannot write a spent credential
+    // over the renewed one.
+    const stale = await prepareManagedAiRuntime(db, runInput);
+    await writeFile(path.join(String((stale.config.env as Record<string, string>).CLAUDE_CONFIG_DIR), ".credentials.json"), auth("stale", now + 18e5));
+    await stale.cleanup();
+    expect(await service.credential(await service.select({ ...runInput, userId }))).toBe(auth("refreshed", now + 72e5));
+    // The native runner replaces CLAUDE_CONFIG_DIR with its own sandbox home,
+    // so that lane still takes the bearer token out of the same credential —
+    // never the whole payload, which is not a bearer token.
+    const runner = await prepareManagedAiRuntime(db, { ...runInput, adapterType: "paperclip_runner", config: { provider: "acpx", acpxAgent: "claude", model: "same-model" } });
+    try {
+      const env = runner.config.env as Record<string, string>;
+      expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("access-refreshed");
+      await expect(access(path.join(String(env.CLAUDE_CONFIG_DIR), ".credentials.json"))).rejects.toThrow();
+    } finally { await runner.cleanup(); }
+  });
   it("discards a credential write-back when the grant is revoked while the run is open", async () => {
     const userId = "revoked-write-back-user";
     await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
