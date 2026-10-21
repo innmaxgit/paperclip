@@ -53,7 +53,7 @@ export const help: Record<string, string> = {
   webhookUrl: "The URL that receives POST requests when the agent is invoked.",
   heartbeatInterval: "Run this agent automatically on a timer. Useful for periodic tasks like checking for new work.",
   intervalSec: "Seconds between automatic heartbeat invocations.",
-  timeoutSec: "Maximum seconds a run can take before being terminated. 0 means no timeout.",
+  timeoutSec: "Maximum seconds a run can take before being terminated. 0 falls back to the adapter default — ACP adapter runs get a 4-hour backstop. Set a negative value to disable the timeout entirely.",
   graceSec: "Seconds to wait after sending interrupt before force-killing the process.",
   wakeOnDemand: "Allow this agent to be woken by assignments, API calls, UI actions, or automated systems.",
   cooldownSec: "Minimum seconds between consecutive heartbeat runs.",
