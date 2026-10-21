@@ -29,6 +29,19 @@ export {
   fetchWithTimeout,
   claudeConfigDir,
 } from "./quota.js";
+// The stored Claude subscription credential: its two accepted forms, and the
+// freshness predicate the credential write-back shares with Codex and Grok.
+export {
+  CLAUDE_CREDENTIALS_FILENAME,
+  CLAUDE_LEGACY_CREDENTIALS_FILENAME,
+  MAX_PLAUSIBLE_EXPIRY_MS as CLAUDE_MAX_PLAUSIBLE_EXPIRY_MS,
+  claudeCredentialAccessToken,
+  decideClaudeAuthMerge,
+  decideClaudeAuthMergeFiles,
+  isRenewableClaudeCredential,
+  parseClaudeOauthCredential,
+} from "./claude-credentials.js";
+export type { ClaudeOauthCredential } from "./claude-credentials.js";
 // The Claude `setup-token` login parser. It reads the interactive login output
 // and returns the authorization URL and the browser-code prompt, or the minted
 // OAuth token from the success record. Both functions fail closed and keep every

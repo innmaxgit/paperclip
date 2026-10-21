@@ -12,6 +12,12 @@ import {
 import { aiConnectionService } from "./ai-connections.js";
 import { secretService } from "./secrets.js";
 import { decideCodexAuthMerge } from "@paperclipai/adapter-codex-local/server";
+import {
+  CLAUDE_CREDENTIALS_FILENAME,
+  claudeCredentialAccessToken,
+  decideClaudeAuthMergeFiles,
+  isRenewableClaudeCredential,
+} from "@paperclipai/adapter-claude-local/server";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { decideGrokAuthMerge } from "@paperclipai/adapter-grok-local/server";
@@ -240,9 +246,6 @@ export async function prepareManagedAiRuntime(
     runnerProvider: input.config.provider,
     acpxAgent: input.config.acpxAgent,
   });
-  const subscriptionFile =
-    selection.attribution.method === "subscription" &&
-    input.binding.provider !== "anthropic";
   let home: string | undefined;
   try {
     const selectedGrantId = selection.grant.id;
@@ -263,6 +266,23 @@ export async function prepareManagedAiRuntime(
       .from(companySecrets).where(and(eq(companySecrets.companyId, input.companyId), eq(companySecrets.id, credentialRef.secretId))).limit(1))[0];
     const freshness = await readFreshness();
     const value = await service.credential(selection);
+    // A subscription credential the provider CLI can renew is written as a
+    // file inside the run's own provider home, so the CLI refreshes it in
+    // place and `cleanup` persists the renewed credential. Anthropic joins
+    // that path only for the Claude CLI adapter, and only for the renewable
+    // credentials payload:
+    //   - A bare access token — all a macOS Keychain login, a connection made
+    //     before this path existed, or a host-operator import can supply —
+    //     has nothing to refresh with.
+    //   - The native runner replaces CLAUDE_CONFIG_DIR with its own sandbox
+    //     home and does not stage this file into it, so that lane keeps
+    //     taking the bearer token.
+    // Either way the credential still goes in as `CLAUDE_CODE_OAUTH_TOKEN`,
+    // and the run ends when the access token does.
+    const subscriptionFile =
+      selection.attribution.method === "subscription" &&
+      (input.binding.provider !== "anthropic" ||
+        (input.adapterType === "claude_local" && isRenewableClaudeCredential(value)));
     const afterRead = await readFreshness();
     if (!freshness || freshness.version !== afterRead?.version || freshness.epoch !== afterRead.epoch) throw unprocessable("The AI credential changed during preparation; retry this execution");
     home = await mkdtemp(
@@ -282,7 +302,11 @@ export async function prepareManagedAiRuntime(
       AI_CONNECTION_CAPABILITIES[input.binding.provider].methods[
         selection.attribution.method
       ]!;
-    const authFile = path.join(providerHome, "auth.json");
+    // Each CLI reads its credential from its own filename inside the home.
+    const authFile = path.join(
+      providerHome,
+      input.binding.provider === "anthropic" ? CLAUDE_CREDENTIALS_FILENAME : "auth.json",
+    );
     if (input.binding.provider === "openai")
       await writeFile(
         path.join(providerHome, "config.toml"),
@@ -290,7 +314,13 @@ export async function prepareManagedAiRuntime(
         { mode: 0o600 },
       );
     if (subscriptionFile) await writeFile(authFile, value, { mode: 0o600 });
-    else env[capability.envKey] = value;
+    // `CLAUDE_CODE_OAUTH_TOKEN` carries a bearer token, so a renewable
+    // credential reaching this branch contributes its access token.
+    else
+      env[capability.envKey] =
+        input.binding.provider === "anthropic"
+          ? (claudeCredentialAccessToken(value) ?? value)
+          : value;
     if (
       input.binding.provider === "openai" &&
       selection.attribution.method === "api_key"
@@ -327,8 +357,10 @@ export async function prepareManagedAiRuntime(
       cleanup: async () => {
         try {
           if (subscriptionFile) {
-            const refreshed = await readFile(authFile, "utf8");
-            if (refreshed !== value)
+            // A CLI that cleared its own credential file (Claude does this
+            // when a refresh token is rejected) leaves nothing to write back.
+            const refreshed = await readFile(authFile, "utf8").catch(() => null);
+            if (refreshed !== null && refreshed !== value)
               await db.transaction(async (tx) => {
                 const [grant] = await tx
                   .select()
@@ -376,9 +408,11 @@ export async function prepareManagedAiRuntime(
                     ? await decideCodexAuthMerge(authFile, destination, {
                         errorLabel: "AI account refresh",
                       })
-                    : await decideGrokAuthMerge(authFile, destination, {
-                        errorLabel: "AI account refresh",
-                      });
+                    : input.binding.provider === "anthropic"
+                      ? await decideClaudeAuthMergeFiles(authFile, destination)
+                      : await decideGrokAuthMerge(authFile, destination, {
+                          errorLabel: "AI account refresh",
+                        });
                 if (decision !== 10) return;
                 await secretService(tx).rotate(
                   ref.secretId,

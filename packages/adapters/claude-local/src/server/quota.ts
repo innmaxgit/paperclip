@@ -5,6 +5,11 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/adapter-utils";
+import {
+  CLAUDE_CREDENTIALS_FILENAME,
+  CLAUDE_LEGACY_CREDENTIALS_FILENAME,
+  parseClaudeOauthCredential,
+} from "./claude-credentials.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -93,40 +98,17 @@ async function readClaudeTokenFromFile(credPath: string): Promise<string | null>
   } catch {
     return null;
   }
-  const credential = parseClaudeCredential(raw);
+  const credential = parseClaudeOauthCredential(raw);
   if (!credential) return null;
   // On macOS the CLI refreshes the Keychain item, not this file, so a file
   // whose token has expired is a stale leftover. Skip it so the caller can
   // fall through to a live credential instead of failing with a dead token.
   if (credential.expiresAt != null && credential.expiresAt <= Date.now()) return null;
-  return credential.token;
-}
-
-interface ClaudeCredential {
-  token: string;
-  /** Epoch milliseconds, when the credential file records one. */
-  expiresAt: number | null;
-}
-
-function parseClaudeCredential(raw: string): ClaudeCredential | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (typeof parsed !== "object" || parsed === null) return null;
-  const obj = parsed as Record<string, unknown>;
-  const oauth = obj["claudeAiOauth"];
-  if (typeof oauth !== "object" || oauth === null) return null;
-  const token = (oauth as Record<string, unknown>)["accessToken"];
-  if (typeof token !== "string" || token.length === 0) return null;
-  const expiresAt = (oauth as Record<string, unknown>)["expiresAt"];
-  return { token, expiresAt: typeof expiresAt === "number" && Number.isFinite(expiresAt) ? expiresAt : null };
+  return credential.accessToken;
 }
 
 function parseClaudeCredentialToken(raw: string): string | null {
-  return parseClaudeCredential(raw)?.token ?? null;
+  return parseClaudeOauthCredential(raw)?.accessToken ?? null;
 }
 
 interface ClaudeAuthStatus {
@@ -190,7 +172,7 @@ export async function readIsolatedClaudeKeychainToken(loginHome: string): Promis
 
 export async function readClaudeToken(options: { allowKeychain?: boolean } = {}): Promise<string | null> {
   const configDir = claudeConfigDir();
-  for (const filename of [".credentials.json", "credentials.json"]) {
+  for (const filename of [CLAUDE_CREDENTIALS_FILENAME, CLAUDE_LEGACY_CREDENTIALS_FILENAME]) {
     const token = await readClaudeTokenFromFile(path.join(configDir, filename));
     if (token) return token;
   }

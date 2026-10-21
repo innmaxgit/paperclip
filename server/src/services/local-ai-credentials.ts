@@ -1,7 +1,14 @@
 import { readLocalAiCredentialFile } from "./local-ai-credential-file.js";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { readClaudeToken, readIsolatedClaudeKeychainToken, fetchClaudeQuota } from "@paperclipai/adapter-claude-local/server";
+import {
+  readClaudeToken,
+  readIsolatedClaudeKeychainToken,
+  fetchClaudeQuota,
+  parseClaudeOauthCredential,
+  CLAUDE_CREDENTIALS_FILENAME,
+  CLAUDE_LEGACY_CREDENTIALS_FILENAME,
+} from "@paperclipai/adapter-claude-local/server";
 import { readCodexAuthInfo, fetchCodexQuota } from "@paperclipai/adapter-codex-local/server";
 import { parseGrokAuthPayload, hasUsableGrokAuthValue } from "@paperclipai/adapter-grok-local/server";
 import type { AiProvider } from "@paperclipai/shared";
@@ -17,25 +24,34 @@ export async function readVerifiedLocalAiCredential(provider: AiProvider, loginH
       // Never change process.env or fall back to the server account when an
       // authenticated user's isolated login is missing or invalid.
       let token: string | null = null;
+      // The value stored for the connection: the whole credentials payload
+      // when the login left a refresh token, so the run's own CLI can renew
+      // the session, and the bare access token when it did not.
+      let credential: string | null = null;
       if (loginHome) {
-        for (const name of [".credentials.json", "credentials.json"]) {
+        for (const name of [CLAUDE_CREDENTIALS_FILENAME, CLAUDE_LEGACY_CREDENTIALS_FILENAME]) {
           const raw = await readLocalAiCredentialFile(path.join(loginHome, name)).catch(() => null);
           if (!raw) continue;
-          let parsed;
-          try { parsed = JSON.parse(raw); } catch { continue; }
-          const value = parsed?.claudeAiOauth?.accessToken;
-          if (typeof value === "string" && value.length) { token = value; break; }
+          const parsed = parseClaudeOauthCredential(raw);
+          if (!parsed) continue;
+          token = parsed.accessToken;
+          credential = parsed.refreshToken ? raw : parsed.accessToken;
+          break;
         }
         // On macOS the CLI stores the isolated login in the auth home's own
         // suffixed Keychain item rather than a credentials file. The helper
-        // never consults the unsuffixed operator item.
-        if (!token) token = await readIsolatedClaudeKeychainToken(loginHome);
+        // never consults the unsuffixed operator item. Only a token comes
+        // back, so such a connection stays a snapshot.
+        if (!token) credential = token = await readIsolatedClaudeKeychainToken(loginHome);
       } else {
-        token = await readClaudeToken({ allowKeychain: true });
+        // The server operator's own machine login. Its refresh token belongs
+        // to the host CLI's rotation, so copying it would let a run's refresh
+        // invalidate the operator's terminal login. Store the token only.
+        credential = token = await readClaudeToken({ allowKeychain: true });
       }
-      if (!token) throw new Error("Missing login");
+      if (!token || !credential) throw new Error("Missing login");
       await fetchClaudeQuota(token);
-      return token;
+      return credential;
     }
     if (provider === "openai") {
       const auth = await readCodexAuthInfo(loginHome);

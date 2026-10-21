@@ -1,7 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { readVerifiedLocalAiCredential } from "../services/local-ai-credentials.js";
 const mocks = vi.hoisted(() => ({ claude: vi.fn(), claudeIsolatedKeychain: vi.fn(), claudeQuota: vi.fn(), codex: vi.fn(), codexQuota: vi.fn(), readFile: vi.fn(), credentialFile: vi.fn() }));
-vi.mock("@paperclipai/adapter-claude-local/server", () => ({ readClaudeToken: mocks.claude, readIsolatedClaudeKeychainToken: mocks.claudeIsolatedKeychain, fetchClaudeQuota: mocks.claudeQuota }));
+// The credential parser and the two filenames come from the adapter itself,
+// so this test cannot drift from the format the CLI actually writes.
+vi.mock("@paperclipai/adapter-claude-local/server", async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  readClaudeToken: mocks.claude,
+  readIsolatedClaudeKeychainToken: mocks.claudeIsolatedKeychain,
+  fetchClaudeQuota: mocks.claudeQuota,
+}));
 vi.mock("@paperclipai/adapter-codex-local/server", () => ({ readCodexAuthInfo: mocks.codex, fetchCodexQuota: mocks.codexQuota }));
 vi.mock("../services/local-ai-credential-file.js", () => ({ readLocalAiCredentialFile: mocks.credentialFile }));
 vi.mock("node:fs/promises", () => ({ default: { readFile: mocks.readFile } }));
@@ -12,6 +19,19 @@ describe("explicit local subscription import", () => {
     await expect(readVerifiedLocalAiCredential("anthropic", "/isolated/claude")).resolves.toBe("isolated-claude");
     expect(mocks.credentialFile).toHaveBeenCalledWith("/isolated/claude/.credentials.json");
     expect(mocks.claudeQuota).toHaveBeenCalledWith("isolated-claude");
+    expect(mocks.claude).not.toHaveBeenCalled();
+  });
+  it("stores the whole Claude payload when the isolated login left a refresh token", async () => {
+    // The connection must keep the refresh token: without it the run's CLI
+    // cannot renew the session and the connection dies with this access
+    // token, a few hours after Connect.
+    const payload = JSON.stringify({
+      claudeAiOauth: { accessToken: "renewable-access", refreshToken: "renewable-refresh", expiresAt: Date.now() + 36e5 },
+    });
+    mocks.credentialFile.mockResolvedValue(payload);
+    await expect(readVerifiedLocalAiCredential("anthropic", "/isolated/claude")).resolves.toBe(payload);
+    // Verification still uses the access token, never the stored payload.
+    expect(mocks.claudeQuota).toHaveBeenCalledWith("renewable-access");
     expect(mocks.claude).not.toHaveBeenCalled();
   });
   it("does not fall back to ambient Claude auth when an isolated login is absent or invalid", async () => {
