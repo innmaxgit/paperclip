@@ -54,7 +54,7 @@ describe("OpenCode timeout reporting", () => {
 
   it.each([
     [0, true, 14400, "sandbox_default"], [12, true, 12, "configured"],
-    [-1, true, 0, "configured"], [0, false, 0, "unlimited"], [12, false, 12, "configured"],
+    [-1, true, 0, "configured"], [0, false, 14400, "local_default"], [12, false, 12, "configured"],
   ] as const)("keeps policy separate from an opaque timeout (%s, remote=%s)", async (configured, remote, resolved, source) => {
     const result = await execute(context(configured, remote));
     expect(result).toMatchObject({ timedOut: true, exitCode: null, signal: null,
