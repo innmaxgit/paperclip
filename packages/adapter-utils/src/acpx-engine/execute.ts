@@ -1,3 +1,4 @@
+import { syncProjectSkills } from "../project-skills.js";
 import { cancellableSandboxStartup } from "./startup-cancellation.js";
 import { withAdapterExecutionPhase, type AdapterExecutionPhase } from "../execution-phase.js";
 import fs from "node:fs/promises";
@@ -2135,6 +2136,26 @@ async function buildRuntime(input: {
     skillsIdentity = { mode: "custom_unsupported", desiredSkillNames: desired };
     if (desired.length > 0) {
       skillCommandNotes.push("Selected Paperclip skills are tracked only; ACPX custom commands do not expose a runtime skill contract yet.");
+    }
+  }
+
+  // Managed AI connections run against a per-run credential home that is
+  // discarded with the run. Sync the project's `.claude/skills` and
+  // `.agents/skills` into it so the provider's own skill discovery sees them
+  // (the shared user config is never touched). Non-managed runs use the
+  // provider's native project discovery.
+  if (config.managedAiConnection && (acpxAgent === "claude" || acpxAgent === "codex")) {
+    const homeKey = acpxAgent === "claude" ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME";
+    const providerHome = asString(env[homeKey], "") || asString(envConfig[homeKey], "");
+    if (providerHome && !executionTargetIsRemote) {
+      await syncProjectSkills({
+        projectRoot: cwd,
+        skillsDir: path.join(providerHome, "skills"),
+        onLog: input.ctx.onLog,
+        label: `ACPX ${acpxAgent} (managed)`,
+      }).catch((err) =>
+        input.ctx.onLog("stderr", `[paperclip] Project skill sync failed: ${err instanceof Error ? err.message : String(err)}\n`),
+      );
     }
   }
 
