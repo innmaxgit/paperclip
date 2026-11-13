@@ -41,7 +41,7 @@ export async function discoverProjectSkills(projectRoot: string): Promise<Projec
   const result: ProjectSkillDiscovery = { entries: [], shadowed: [], skipped: [] };
   const realRoot = await fs.realpath(projectRoot).catch(() => null);
   if (!realRoot) return result;
-  const winners = new Map<string, string>();
+  const winners = new Map<string, { origin: string; source: string }>();
   for (const origin of PROJECT_SKILL_SOURCE_DIRS) {
     const dirents = await fs.readdir(path.join(realRoot, origin), { withFileTypes: true }).catch(() => []);
     for (const dirent of dirents.sort((a, b) => a.name.localeCompare(b.name))) {
@@ -68,10 +68,11 @@ export async function discoverProjectSkills(projectRoot: string): Promise<Projec
       }
       const winner = winners.get(name);
       if (winner) {
-        result.shadowed.push({ name, origin, winner });
+        // A `.claude/skills/x -> ../../.agents/skills/x` link is one skill, not a conflict.
+        if (winner.source !== real) result.shadowed.push({ name, origin, winner: winner.origin });
         continue;
       }
-      winners.set(name, origin);
+      winners.set(name, { origin, source: real });
       result.entries.push({ name, source: real, origin });
     }
   }
@@ -84,6 +85,12 @@ export interface SyncProjectSkillsInput {
   skillsDir: string;
   /** Only sync skills from these sources (default: all). */
   origins?: readonly ProjectSkillEntry["origin"][];
+  /**
+   * Skip skills whose real source lives under this project-relative directory
+   * (e.g. `.agents/skills` for Codex, which already discovers it natively and
+   * would otherwise list a symlinked skill twice).
+   */
+  excludeSourceUnder?: string;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   label: string;
 }
@@ -98,7 +105,11 @@ export async function syncProjectSkills(input: SyncProjectSkillsInput): Promise<
   const discovery = await discoverProjectSkills(input.projectRoot);
   await fs.mkdir(input.skillsDir, { recursive: true });
   const synced: string[] = [];
+  const excludeRoot = input.excludeSourceUnder
+    ? await fs.realpath(path.join(input.projectRoot, input.excludeSourceUnder)).catch(() => null)
+    : null;
   for (const entry of discovery.entries) {
+    if (excludeRoot && isWithin(excludeRoot, entry.source)) continue;
     if (input.origins && !input.origins.includes(entry.origin)) continue;
     const target = path.join(input.skillsDir, entry.name);
     try {

@@ -76,3 +76,25 @@ describe("project skills", () => {
     expect(await syncProjectSkills({ projectRoot: root, skillsDir: out, origins: [".agents/skills"], onLog, label: "t" })).toEqual(["b"]);
   });
 });
+
+describe("project skills dedupe", () => {
+  it("does not report a symlink to the same source as shadowed", async () => {
+    await skill(path.join(root, ".agents/skills"), "x");
+    await fs.mkdir(path.join(root, ".claude/skills"), { recursive: true });
+    await fs.symlink("../../.agents/skills/x", path.join(root, ".claude/skills/x"));
+    const found = await discoverProjectSkills(root);
+    expect(found.entries).toHaveLength(1);
+    expect(found.shadowed).toEqual([]);
+  });
+});
+
+describe("project skills excludeSourceUnder", () => {
+  it("skips skills whose real source is under the excluded directory", async () => {
+    await skill(path.join(root, ".agents/skills"), "native");
+    await skill(path.join(root, ".claude/skills"), "claude-only");
+    await fs.symlink("../../.agents/skills/native", path.join(root, ".claude/skills/native"));
+    const out = path.join(root, "out");
+    const synced = await syncProjectSkills({ projectRoot: root, skillsDir: out, origins: [".claude/skills"], excludeSourceUnder: ".agents/skills", onLog, label: "t" });
+    expect(synced).toEqual(["claude-only"]);
+  });
+});
