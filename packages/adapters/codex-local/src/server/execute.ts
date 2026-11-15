@@ -91,6 +91,7 @@ import {
 } from "./auth-precedence.js";
 import { prepareCodexRuntimeConfig } from "./runtime-config.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
+import { syncProjectSkills } from "@paperclipai/adapter-utils/project-skills";
 import { buildCodexExecArgs } from "./codex-args.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
@@ -789,6 +790,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         desiredSkillNames,
       },
     );
+    // Codex natively discovers `<repo>/.agents/skills` (verified with a fresh
+    // CODEX_HOME) but never `.claude/skills`, so only `.claude/skills` entries
+    // are synced into a managed run's per-run CODEX_HOME. Unmanaged runs share
+    // the company home, which stays untouched.
+    if (config.managedAiConnection) {
+      await syncProjectSkills({
+        projectRoot: cwd,
+        skillsDir: codexSkillsDir,
+        origins: [".claude/skills"],
+        excludeSourceUnder: ".agents/skills",
+        onLog,
+        label: "Codex (managed)",
+      }).catch((err) =>
+        onLog("stderr", `[paperclip] Project skill sync failed: ${err instanceof Error ? err.message : String(err)}\n`),
+      );
+    }
     const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
       executionTarget,
       asNumber(config.timeoutSec, 0),
