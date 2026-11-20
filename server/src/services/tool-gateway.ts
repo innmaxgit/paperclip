@@ -804,6 +804,12 @@ function timeoutMs(value: number | undefined, tool?: ToolGatewayDescriptor) {
   );
 }
 
+function connectionToolTimeoutMs(config: unknown): number | undefined {
+  const value = (config as { toolTimeoutMs?: unknown } | null | undefined)?.toolTimeoutMs;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return undefined;
+  return Math.min(60_000, Math.floor(value));
+}
+
 function sessionTtlMs(value: number | undefined) {
   if (!Number.isFinite(value)) return DEFAULT_SESSION_TTL_MS;
   return Math.max(
@@ -6292,6 +6298,7 @@ export function createToolGatewayService(
       tool,
     );
     await assertApplicationFeatureAvailable(tool.applicationKey);
+    if (useDefaultTimeout) ms = connectionToolTimeoutMs(connection.config) ?? ms;
     // Recheck immediately before dispatch, including previously approved calls
     // and connections whose stored grant/catalog predates scope reduction.
     assertGoogleChatToolArgumentsSupported(connection, entry.toolName, parameters);
@@ -6974,6 +6981,7 @@ export function createToolGatewayService(
       session,
       tool,
     );
+    if (useProviderDefaultTimeout) ms = connectionToolTimeoutMs(connection.config) ?? ms;
     const grant = await resolveConnectionGrant(session, connection);
     const template = await resolveLocalStdioRuntimeTemplate(connection);
     const env = await localStdioEnvironment(
