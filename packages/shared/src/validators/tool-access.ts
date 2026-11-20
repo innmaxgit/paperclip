@@ -147,7 +147,22 @@ export const mcpConnectionCredentialRefSchema = z.object({
   prefix: z.string().max(120).nullable().optional(),
 });
 
-export const toolTransportConfigSchema = z.record(z.string(), z.unknown()).superRefine(rejectSensitiveConfigKeys);
+export const TOOL_TIMEOUT_MS_DEFAULT = 10_000;
+export const TOOL_TIMEOUT_MS_MAX = 60_000;
+
+export const toolTransportConfigSchema = z.record(z.string(), z.unknown())
+  .superRefine(rejectSensitiveConfigKeys)
+  .superRefine((config, ctx) => {
+    const value = config.toolTimeoutMs;
+    if (value === undefined) return;
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > TOOL_TIMEOUT_MS_MAX) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["toolTimeoutMs"],
+        message: `toolTimeoutMs must be an integer between 1 and ${TOOL_TIMEOUT_MS_MAX}`,
+      });
+    }
+  });
 
 export const toolRedactedValueSummarySchema = z.object({
   summary: z.string().max(4000),

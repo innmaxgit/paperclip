@@ -192,9 +192,15 @@ export function createConnectionHealth(db: Db, { now, audit, getConnectionRow, d
       )
         throw error;
       const failure = sanitizeHttpFailure(error);
+      // A slow probe is not proof the connection is broken: keep a previously
+      // healthy connection listed. Refused, auth and session failures still
+      // flip it to error.
+      const keepHealth =
+        failure.code === "remote_http_response_timeout" &&
+        (connection.healthStatus === "ok" || connection.healthStatus === "healthy");
       const updated = await updateConnectionHealth(
         connection,
-        failure.status,
+        keepHealth ? connection.healthStatus : failure.status,
         failure.message,
       );
       const runtimeSlot =

@@ -4700,6 +4700,14 @@ rl.on("line", (line) => {
           status: scenario.status === 504 ? "timed_out" : "failed",
           errorCode: scenario.reasonCode,
         });
+        if (scenario.reasonCode === "tool_timeout") {
+          // A per-call timeout says nothing about the connection: it must stay
+          // healthy so the next request still lists and can call its tools.
+          const [connection] = await db.select().from(toolConnections);
+          expect(connection.healthStatus).toBe("ok");
+          expect((await gateway.listToolsForSession(session.token))
+            .some((tool) => tool.providerType === "mcp_remote_http")).toBe(true);
+        }
         const [failureAudit] = await db
           .select()
           .from(activityLog)
