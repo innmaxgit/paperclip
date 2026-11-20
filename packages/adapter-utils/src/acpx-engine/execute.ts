@@ -2,6 +2,7 @@ import { isOpenRouterUrl, openRouterClaudeHeaders } from "@paperclipai/shared/op
 import { prepareAcpxCodexObservabilityHome } from "../codex-observability-home.js";
 import { codexShellEnvironmentKeys } from "../codex-shell-environment.js";
 import { applyObservabilityEnvironment } from "../agent-observability.js";
+import { syncProjectSkills } from "../project-skills.js";
 import { cancellableSandboxStartup } from "./startup-cancellation.js";
 import { emitStartupReuse, environmentStartupReuse, summarizeStartupReuse, type StartupReuseReason } from "../startup-reuse.js";
 import { withAdapterExecutionPhase, type AdapterExecutionPhase } from "../execution-phase.js";
@@ -2219,6 +2220,31 @@ async function buildRuntime(input: {
     skillsIdentity = { mode: "custom_unsupported", desiredSkillNames: desired };
     if (desired.length > 0) {
       skillCommandNotes.push("Selected Paperclip skills are tracked only; ACPX custom commands do not expose a runtime skill contract yet.");
+    }
+  }
+
+  // Managed AI connections run against a per-run credential home that is
+  // discarded with the run. Sync the project's `.claude/skills` and
+  // `.agents/skills` into it so the provider's own skill discovery sees them
+  // (the shared user config is never touched). Codex discovers `.agents/skills`
+  // natively, so only `.claude/skills` is synced for it. Non-managed runs use
+  // the provider's native project discovery.
+  if (config.managedAiConnection && (acpxAgent === "claude" || acpxAgent === "codex")) {
+    const homeKey = acpxAgent === "claude" ? "CLAUDE_CONFIG_DIR" : "CODEX_HOME";
+    const providerHome = asString(env[homeKey], "") || asString(envConfig[homeKey], "");
+    if (providerHome && !executionTargetIsRemote) {
+      await syncProjectSkills({
+        projectRoot: cwd,
+        skillsDir: path.join(providerHome, "skills"),
+        // Codex already discovers `.agents/skills` natively and never reads `.claude/skills`.
+        ...(acpxAgent === "codex"
+          ? { origins: [".claude/skills"] as const, excludeSourceUnder: ".agents/skills" }
+          : {}),
+        onLog: input.ctx.onLog,
+        label: `ACPX ${acpxAgent} (managed)`,
+      }).catch((err) =>
+        input.ctx.onLog("stderr", `[paperclip] Project skill sync failed: ${err instanceof Error ? err.message : String(err)}\n`),
+      );
     }
   }
 

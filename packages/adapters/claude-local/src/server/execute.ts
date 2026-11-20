@@ -98,6 +98,7 @@ import { prepareCompatibleClaudeCommand } from "./sandbox-cli-version.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
 import { isBedrockModelId } from "./models.js";
 import { prepareClaudePromptBundle } from "./prompt-cache.js";
+import { syncProjectSkills } from "@paperclipai/adapter-utils/project-skills";
 import { buildClaudeExecutionPermissionArgs, claudeSandboxPermissionEnv } from "./permissions.js";
 import { resolveClaudeModel, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import {
@@ -616,6 +617,36 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       `[paperclip] Confining Claude with ${scopes} scope.\n`,
     );
   }
+  // Managed runs pass `--setting-sources user`, so the CLI never reads the
+  // project's `.claude/skills`. The per-run provider home is the "user"
+  // source and is discarded with the run, so project skills (`.claude/skills`
+  // first, then `.agents/skills`) are synced into its `skills/`. Unmanaged
+  // runs read the shared user config, which must not be mutated per run; the
+  // CLI already loads `.claude/skills` natively, so only `.agents/skills`
+  // entries are staged into a per-run `--add-dir` removed in `finally`.
+  let projectSkillsStageDir: string | null = null;
+  const projectSkillsConfigDir = asString(env.CLAUDE_CONFIG_DIR, "");
+  if (config.managedAiConnection && projectSkillsConfigDir) {
+    await syncProjectSkills({
+      projectRoot: cwd,
+      skillsDir: path.join(projectSkillsConfigDir, "skills"),
+      onLog,
+      label: "Claude (managed)",
+    }).catch((err) =>
+      onLog("stderr", `[paperclip] Project skill sync failed: ${err instanceof Error ? err.message : String(err)}\n`),
+    );
+  } else if (!config.managedAiConnection && !executionTargetIsRemote) {
+    const stageDir = path.join(claudeRuntimeStateDir, "project-skills", runId);
+    const synced = await syncProjectSkills({
+      projectRoot: cwd,
+      skillsDir: path.join(stageDir, ".claude", "skills"),
+      origins: [".agents/skills"],
+      onLog,
+      label: "Claude",
+    }).catch(() => [] as string[]);
+    if (synced.length > 0) projectSkillsStageDir = stageDir;
+    else await fs.rm(stageDir, { recursive: true, force: true }).catch(() => {});
+  }
   const useManagedRemoteClaudeConfig =
     executionTargetIsRemote &&
     adapterExecutionTargetUsesManagedHome(executionTarget) &&
@@ -877,6 +908,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       args.push("--mcp-config", effectiveMcpConfigPath, "--strict-mcp-config");
     }
     args.push("--add-dir", effectivePromptBundleAddDir);
+    if (projectSkillsStageDir) args.push("--add-dir", projectSkillsStageDir);
     if (extraArgs.length > 0) args.push(...extraArgs);
     return args;
   };
@@ -1430,6 +1462,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     try {
       await providerStop.collectBeforeRestore();
     } finally {
+      if (projectSkillsStageDir) {
+        await fs.rm(projectSkillsStageDir, { recursive: true, force: true }).catch(() => {});
+      }
       if (paperclipBridge) {
         await paperclipBridge.stop();
       }
