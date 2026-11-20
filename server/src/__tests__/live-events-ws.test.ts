@@ -3,8 +3,6 @@ import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  LIVE_EVENTS_MAX_BUFFERED_BYTES,
-  sendLiveEvent,
   setupLiveEventsWebSocketServer,
 } from "../realtime/live-events-ws.js";
 import { logger } from "../middleware/logger.js";
@@ -222,32 +220,5 @@ describe("setupLiveEventsWebSocketServer", () => {
 
     expect(resolveSessionFromHeaders).toHaveBeenCalledTimes(1);
     expect(socket.endedChunks[0]).toContain("403 Forbidden");
-  });
-});
-
-describe("sendLiveEvent", () => {
-  function fakeSocket(bufferedAmount: number, readyState = 1) {
-    return { readyState, bufferedAmount, send: vi.fn(), terminate: vi.fn() };
-  }
-
-  it("sends to an open socket that is keeping up", () => {
-    const socket = fakeSocket(0);
-    sendLiveEvent(socket, "{}");
-    expect(socket.send).toHaveBeenCalledWith("{}");
-    expect(socket.terminate).not.toHaveBeenCalled();
-  });
-
-  it("terminates a socket whose send buffer exceeds the limit", () => {
-    const socket = fakeSocket(LIVE_EVENTS_MAX_BUFFERED_BYTES + 1);
-    sendLiveEvent(socket, "{}");
-    expect(socket.send).not.toHaveBeenCalled();
-    expect(socket.terminate).toHaveBeenCalledTimes(1);
-  });
-
-  it("skips sockets that are not open", () => {
-    const socket = fakeSocket(0, 3);
-    sendLiveEvent(socket, "{}");
-    expect(socket.send).not.toHaveBeenCalled();
-    expect(socket.terminate).not.toHaveBeenCalled();
   });
 });

@@ -136,8 +136,9 @@ function createFakeStatefulMcpServer() {
     concurrency.inFlight += 1;
     concurrency.max = Math.max(concurrency.max, concurrency.inFlight);
     try {
-      if (typeof args.delayMs === "number") {
-        await new Promise((resolve) => setTimeout(resolve, args.delayMs));
+      const delayMs = args.delayMs;
+      if (typeof delayMs === "number") {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
       dispatchOrder.push(
         typeof args.label === "string" ? args.label : String(name),
