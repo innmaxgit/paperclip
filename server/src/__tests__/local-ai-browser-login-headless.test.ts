@@ -54,4 +54,18 @@ describe("local Claude browser login on a headless host", () => {
     await until(() => state.outcome === "failure");
     expect(state.error).toMatch(/before a sign-in link/);
   });
+
+  it("does not apply the Claude prompt timeout to OpenAI (keeps its 300s wait)", async () => {
+    await fakeClaude(`exit 0`);
+    const dir = dirs[dirs.length - 1];
+    await writeFile(join(dir, "codex"), `#!/bin/sh\nsleep 30\n`);
+    await chmod(join(dir, "codex"), 0o755);
+    const home = await mkdtemp(join(tmpdir(), "login-home-")); dirs.push(home);
+    const state = startLocalBrowserLogin("openai", home, { promptTimeoutMs: 300 });
+    try {
+      await new Promise(r => setTimeout(r, 1200));
+      expect(state.outcome).toBeUndefined();
+      expect(state.error).toBeUndefined();
+    } finally { state.abort(); }
+  });
 });

@@ -102,15 +102,16 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "googl
     async dispose() { child?.kill("SIGTERM"); },
     async readFile(file: string) { const { readLocalAiCredentialFile } = await import("./local-ai-credential-file.js"); return Buffer.from(await readLocalAiCredentialFile(file)); },
   };
-  const promptTimer = setTimeout(() => {
+  // Claude-only: OpenAI keeps its original 300s device-login wait.
+  const promptTimer = provider !== "anthropic" ? undefined : setTimeout(() => {
     if (state.authorizationUrl || state.outcome) return;
     state.error ??= "Sign-in did not produce a sign-in link in time. Start sign-in again.";
     state.outcome = "failure";
     controller.abort();
   }, options.promptTimeoutMs ?? BROWSER_LOGIN_PROMPT_TIMEOUT_MS);
-  promptTimer.unref();
+  promptTimer?.unref();
   const finish = (result: { outcome: string } | null) => {
-    clearTimeout(promptTimer);
+    if (promptTimer) clearTimeout(promptTimer);
     if (state.outcome) return;
     state.outcome = result?.outcome === "success" ? "success" : "failure";
     if (state.outcome === "failure") {
