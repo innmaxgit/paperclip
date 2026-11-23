@@ -312,6 +312,17 @@ function hasValidQuery(parsed: URL): boolean {
   return true;
 }
 
+// `claude` 2.1.330 emits the authorization URL with one opaque query token and no
+// named keys (`https://claude.ai/oauth/authorize?<token>`). The parser accepts
+// that shape only when the query is a single URL-safe token with no `=` or `&`.
+const OPAQUE_QUERY_RE = /^[A-Za-z0-9_-]{16,512}$/;
+
+/** Returns true when the query of `parsed` is the single opaque token form. */
+function hasOpaqueQuery(parsed: URL): boolean {
+  if (!parsed.search.startsWith("?")) return false;
+  return OPAQUE_QUERY_RE.test(parsed.search.slice(1));
+}
+
 /**
  * Returns `candidate` when it is a valid authorization URL, or null. The final
  * validator applies to every candidate, from an OSC 8 URI or from a plain-text
@@ -335,7 +346,7 @@ function validateAuthUrl(candidate: string): string | null {
   if (parsed.port !== "" || parsed.hash !== "") return null;
   const pair = `${parsed.origin}${parsed.pathname}`;
   if (!SETUP_TOKEN_AUTH_URLS.includes(pair as (typeof SETUP_TOKEN_AUTH_URLS)[number])) return null;
-  if (!hasValidQuery(parsed)) return null;
+  if (!hasValidQuery(parsed) && !hasOpaqueQuery(parsed)) return null;
   return candidate;
 }
 
@@ -357,7 +368,17 @@ function reassembleUrl(lines: string[], startLine: number): SetupTokenUrlMatch |
     joined += trimmed;
     if (joined.length > MAX_URL_LENGTH) break;
     const url = validateAuthUrl(joined);
-    if (url) return { url, endLine: startLine + offset };
+    if (url) {
+      // A truncated first fragment of a wrapped opaque URL validates on its own.
+      // Fail closed: accept the opaque form only on the first line, and only
+      // when the next line is not a different URL fragment.
+      if (!url.includes("=")) {
+        if (offset !== 0) return null;
+        const next = (lines[startLine + 1] ?? "").trim();
+        if (next.length > 0 && URL_CHARS_ONLY_RE.test(next) && next !== url) return null;
+      }
+      return { url, endLine: startLine + offset };
+    }
   }
   return null;
 }
