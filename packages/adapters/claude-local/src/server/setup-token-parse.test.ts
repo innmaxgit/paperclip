@@ -194,6 +194,31 @@ describe("parseSetupTokenPrompt", () => {
     expect(parseSetupTokenPrompt(completeOutput(crossPair))).toBeNull();
   });
 
+  it("accepts the 2.1.330 opaque single-token query URL through an OSC 8 hyperlink", () => {
+    const opaque = "https://claude.ai/oauth/authorize?Ab1Cd2Ef3Gh4Ij5Kl6Mn7Op8Qr9St0Uv1Wx2Yz3";
+    const text = [
+      chaSpaced(["Browser", "didn't", "open?", "Use", "the", "URL", "below", "to", "sign", "in", "(c", "to", "copy)"]),
+      osc8Hyperlink(opaque, opaque),
+      chaSpaced(["Paste", "code", "here", "if", "prompted"]),
+    ].join("\r\n\r\n");
+    const result = parseSetupTokenPrompt(text);
+    expect(result?.url).toBe(opaque);
+    expect(result?.prompt).toBe(SETUP_TOKEN_PROMPT);
+  });
+
+  it("returns null for an opaque query URL that wraps onto a second fragment line", () => {
+    const opaque = "https://claude.ai/oauth/authorize?Ab1Cd2Ef3Gh4Ij5Kl6Mn7Op8Qr9St0Uv1Wx2Yz3";
+    const wrapped = `${opaque.slice(0, 50)}\n${opaque.slice(50)}`;
+    expect(parseSetupTokenPrompt([PREAMBLE_LINE, wrapped, PROMPT_LINE].join("\n"))).toBeNull();
+  });
+
+  it("returns null for an opaque query on a wrong host or with a key-shaped value", () => {
+    const bad = "https://evil.example/oauth/authorize?Ab1Cd2Ef3Gh4Ij5Kl6Mn7Op8Qr9St0Uv1Wx2Yz3";
+    expect(parseSetupTokenPrompt(completeOutput(bad))).toBeNull();
+    const key = "https://claude.ai/oauth/authorize?sk-ant-Ab1Cd2Ef3Gh4Ij5Kl6Mn7Op8Qr9St0Uv1";
+    expect(parseSetupTokenPrompt(completeOutput(key))).toBeNull();
+  });
+
   it("returns null for a missing query key", () => {
     const missingKey = CLAUDE_COM_URL.replace(`&state=${STATE}`, "");
     expect(parseSetupTokenPrompt(completeOutput(missingKey))).toBeNull();

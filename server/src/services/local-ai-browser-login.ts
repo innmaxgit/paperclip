@@ -7,6 +7,10 @@ import { runDeviceLogin } from "@paperclipai/adapter-codex-local/server";
 import { ensureCommandResolvable, resolveCommandForLogs } from "@paperclipai/adapter-utils/server-utils";
 import { resolveCodexCommand, startAntigravityBrowserLogin } from "../vendor/paperclip-runner/index.js";
 
+// A sign-in that has not produced an authorization URL by then is failed with an
+// explicit error instead of leaving the UI on "Preparing browser sign-in…".
+export const BROWSER_LOGIN_PROMPT_TIMEOUT_MS = 45_000;
+
 export type LocalBrowserLoginState = {
   authorizationUrl?: string;
   code?: string;
@@ -47,7 +51,7 @@ sys.exit(os.waitstatus_to_exitcode(status))
 `;
 
 /** Run the same browser-code login used by sandbox connections on the local host. */
-export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "google", home: string): LocalBrowserLoginState {
+export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "google", home: string, options: { promptTimeoutMs?: number } = {}): LocalBrowserLoginState {
   if (provider === "google") return startAntigravityBrowserLogin(home);
   const controller = new AbortController();
   const state: LocalBrowserLoginState = { abort: () => controller.abort() };
@@ -98,6 +102,28 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "googl
     async dispose() { child?.kill("SIGTERM"); },
     async readFile(file: string) { const { readLocalAiCredentialFile } = await import("./local-ai-credential-file.js"); return Buffer.from(await readLocalAiCredentialFile(file)); },
   };
+  // Claude-only: OpenAI keeps its original 300s device-login wait.
+  const promptTimer = provider !== "anthropic" ? undefined : setTimeout(() => {
+    if (state.authorizationUrl || state.outcome) return;
+    state.error ??= "Sign-in did not produce a sign-in link in time. Start sign-in again.";
+    state.outcome = "failure";
+    controller.abort();
+  }, options.promptTimeoutMs ?? BROWSER_LOGIN_PROMPT_TIMEOUT_MS);
+  promptTimer?.unref();
+  const finish = (result: { outcome: string } | null) => {
+    if (promptTimer) clearTimeout(promptTimer);
+    if (state.outcome) return;
+    state.outcome = result?.outcome === "success" ? "success" : "failure";
+    if (state.outcome === "failure" && provider === "anthropic") {
+      state.error ??= result?.outcome === "timeout"
+        ? "Sign-in timed out. Start sign-in again."
+        : result?.outcome === "cancelled"
+          ? "Sign-in was cancelled. Start sign-in again."
+          : !state.authorizationUrl
+            ? "Sign-in ended before a sign-in link was produced. Check that the provider CLI is installed and up to date on this host, then start sign-in again."
+            : undefined;
+    }
+  };
   if (provider === "anthropic") {
     let deliverCode: ((code: string) => void) | undefined;
     const codeReady = new Promise<string>((resolve) => { deliverCode = resolve; });
@@ -120,14 +146,12 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "googl
           await file.close();
         }
       },
-    }).then((result) => { state.outcome = result.outcome === "success" ? "success" : "failure"; })
-      .catch(() => { state.outcome = "failure"; });
+    }).then(finish, () => finish(null));
   } else {
     void runDeviceLogin(driver, {
       timeoutMs: 300_000, signal: controller.signal,
       onPrompt: (prompt) => { state.authorizationUrl = prompt.url; state.code = prompt.code; },
-    }).then((result) => { state.outcome = result.outcome === "success" ? "success" : "failure"; })
-      .catch(() => { state.outcome = "failure"; });
+    }).then(finish, () => finish(null));
   }
   return state;
 }
