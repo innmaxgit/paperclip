@@ -114,7 +114,7 @@ export function startLocalBrowserLogin(provider: "anthropic" | "openai" | "googl
     if (promptTimer) clearTimeout(promptTimer);
     if (state.outcome) return;
     state.outcome = result?.outcome === "success" ? "success" : "failure";
-    if (state.outcome === "failure") {
+    if (state.outcome === "failure" && provider === "anthropic") {
       state.error ??= result?.outcome === "timeout"
         ? "Sign-in timed out. Start sign-in again."
         : result?.outcome === "cancelled"
