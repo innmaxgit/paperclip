@@ -11783,6 +11783,30 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).toBe(true);
   });
 
+  it("re-dispatches a handed-off todo issue when the previous assignee's recovery run was cancelled", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "cancelled",
+      retryReason: "assignment_recovery",
+      runErrorCode: "issue_reassigned",
+      runError: "Cancelled before issue reassignment",
+    });
+    const nextAgentId = randomUUID();
+    await db.insert(agents).values(recoveryAgentRow(nextAgentId, companyId, "PostReviewer", "engineer", "idle"));
+    await db.update(issues).set({ assigneeAgentId: nextAgentId }).where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(0);
+    expect(result.dispatchRequeued).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await selectRecoveryIssueById(issueId);
+    expect(issue?.status).toBe("todo");
+    expect(await selectRecoveryRunsByAgent(nextAgentId)).toHaveLength(1);
+    expect(await selectRecoveryRunsByAgent(agentId)).toHaveLength(1);
+  });
+
   it("blocks an already stranded recovery issue without creating a recovery child", async () => {
     const { companyId, issueId } = await seedStrandedIssueFixture({
       status: "todo",

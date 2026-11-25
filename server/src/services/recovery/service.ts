@@ -5410,7 +5410,10 @@ export function recoveryService(
           continue;
         }
 
-        if (didAutomaticRecoveryFail(latestRun, "assignment_recovery")) {
+        // A recovery run that belonged to a previous assignee says nothing about
+        // dispatch to the current one: a reviewer handing the issue on cancels
+        // its own (recovery) run, and that must not spend the new assignee's retry.
+        if (latestRun.agentId === agentId && didAutomaticRecoveryFail(latestRun, "assignment_recovery")) {
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "todo",
