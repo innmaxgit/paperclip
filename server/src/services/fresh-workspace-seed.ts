@@ -11,7 +11,9 @@ import { materializeIsolatedTaskDirectory } from "./isolated-task-directory.js";
 import { workspaceGitOperationScheduler } from "./workspace-git-operation-scheduler.js";
 
 const execFile = promisify(execFileCallback);
-const gitOptions = { timeout: 120_000, maxBuffer: 1024 * 1024 };
+// A cold clone of a ~400 MB repository on a busy spinning disk has taken over
+// two minutes here, while the same clone takes 15 s when the disk is idle.
+const gitOptions = { timeout: 600_000, maxBuffer: 1024 * 1024 };
 const PRIOR_WORKSPACE_FILE_LIMIT = 50;
 
 /** R2: a fresh attempt starts from committed files, so it must say where the
